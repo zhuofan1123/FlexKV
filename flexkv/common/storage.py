@@ -173,11 +173,14 @@ class StorageHandle:
     remote_config_custom: Optional[Dict[str, Any]] = None
 
     def get_tensor_list(self) -> List[torch.Tensor]:
-        assert isinstance(self.data, list) and \
+        assert isinstance(self.data, torch.Tensor) or \
+                isinstance(self.data, list) and \
                 (all(isinstance(x, torch.Tensor) for x in self.data) or \
                 all(isinstance(x, TensorSharedHandle) for x in self.data)), \
                 "handle data must be List[Tensor] or List[TensorWrapper]"
         if self.handle_type == AccessHandleType.TENSOR:
+            if isinstance(self.data, torch.Tensor):
+                return [self.data]
             return self.data  # type: ignore
         elif self.handle_type == AccessHandleType.TENSOR_HANDLE:
             assert all(isinstance(x, TensorSharedHandle) for x in self.data), \

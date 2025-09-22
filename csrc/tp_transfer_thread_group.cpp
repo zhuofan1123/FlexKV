@@ -1,6 +1,6 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,21 +22,21 @@ namespace flexkv {
 
 TPTransferThreadGroup::TPTransferThreadGroup(
     int num_gpus, const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
-    torch::Tensor &cpu_blocks, int dp_group_id,
+    const std::vector<torch::Tensor> &cpu_blocks_list, int dp_group_id,
     torch::Tensor &gpu_kv_strides_tensor,
     torch::Tensor &gpu_block_strides_tensor,
     torch::Tensor &gpu_chunk_sizes_tensor) {
 
   num_gpus_ = num_gpus;
-  
+
   gpu_kv_strides_in_bytes_ = new int64_t[num_gpus];
   gpu_block_strides_in_bytes_ = new int64_t[num_gpus];
   gpu_chunk_sizes_in_bytes_ = new int64_t[num_gpus];
-  
-  int64_t* kv_strides_ptr = gpu_kv_strides_tensor.data_ptr<int64_t>();
-  int64_t* block_strides_ptr = gpu_block_strides_tensor.data_ptr<int64_t>();
-  int64_t* chunk_sizes_ptr = gpu_chunk_sizes_tensor.data_ptr<int64_t>();
-  
+
+  int64_t *kv_strides_ptr = gpu_kv_strides_tensor.data_ptr<int64_t>();
+  int64_t *block_strides_ptr = gpu_block_strides_tensor.data_ptr<int64_t>();
+  int64_t *chunk_sizes_ptr = gpu_chunk_sizes_tensor.data_ptr<int64_t>();
+
   for (int i = 0; i < num_gpus; i++) {
     gpu_kv_strides_in_bytes_[i] = kv_strides_ptr[i];
     gpu_block_strides_in_bytes_[i] = block_strides_ptr[i];
@@ -44,8 +44,8 @@ TPTransferThreadGroup::TPTransferThreadGroup(
   }
 
   queues_.resize(num_gpus_);
-  mtxs_   = std::vector<std::mutex>(num_gpus_);
-  cvs_    = std::vector<std::condition_variable>(num_gpus_);
+  mtxs_ = std::vector<std::mutex>(num_gpus_);
+  cvs_ = std::vector<std::condition_variable>(num_gpus_);
 
   int num_layers = gpu_blocks[0].size();
   cudaMallocHost((void **)&gpu_blocks_,
@@ -56,7 +56,10 @@ TPTransferThreadGroup::TPTransferThreadGroup(
     }
   }
 
-  cpu_blocks_ = cpu_blocks.data_ptr();
+  cpu_blocks_ptrs_.reserve(cpu_blocks_list.size());
+  for (const auto &tensor : cpu_blocks_list) {
+    cpu_blocks_ptrs_.push_back(tensor.data_ptr());
+  }
 
   dp_group_id_ = dp_group_id;
   streams_.resize(num_gpus_);
@@ -65,47 +68,51 @@ TPTransferThreadGroup::TPTransferThreadGroup(
     cudaStreamCreate(&streams_[i]);
   }
   // create the thread pool
-  stop_pool_=false;
+  stop_pool_ = false;
   for (int i = 0; i < num_gpus_; ++i) {
     threads_.emplace_back([this, i]() {
       int device_id = dp_group_id_ * num_gpus_ + i;
-      cudaSetDevice(device_id);  // only once
+      cudaSetDevice(device_id); // only once
 
       while (true) {
         Task task;
         {
           std::unique_lock<std::mutex> lk(mtxs_[i]);
-          cvs_[i].wait(lk, [&]{ return stop_pool_ || !queues_[i].empty(); });
-          if (stop_pool_ && queues_[i].empty()) return;
+          cvs_[i].wait(lk, [&] { return stop_pool_ || !queues_[i].empty(); });
+          if (stop_pool_ && queues_[i].empty())
+            return;
 
           task = std::move(queues_[i].front());
           queues_[i].pop();
         }
-        task();  // 
+        task(); //
       }
     });
   }
-
 }
 
 TPTransferThreadGroup::~TPTransferThreadGroup() {
   stop_pool_ = true;
-  for (auto& cv : cvs_) cv.notify_all();
-  for (auto& t : threads_) if (t.joinable()) t.join();
+  for (auto &cv : cvs_)
+    cv.notify_all();
+  for (auto &t : threads_)
+    if (t.joinable())
+      t.join();
 
   cudaFreeHost(gpu_blocks_);
-  
+
   delete[] gpu_kv_strides_in_bytes_;
   delete[] gpu_block_strides_in_bytes_;
   delete[] gpu_chunk_sizes_in_bytes_;
 }
 
-std::future<void> TPTransferThreadGroup::enqueue_for_gpu(int gpu_idx, Task task) {
+std::future<void> TPTransferThreadGroup::enqueue_for_gpu(int gpu_idx,
+                                                         Task task) {
   auto pkg = std::make_shared<std::packaged_task<void()>>(std::move(task));
   auto fut = pkg->get_future();
   {
-      std::lock_guard<std::mutex> lk(mtxs_[gpu_idx]);
-      queues_[gpu_idx].emplace([pkg]{ (*pkg)(); });
+    std::lock_guard<std::mutex> lk(mtxs_[gpu_idx]);
+    queues_[gpu_idx].emplace([pkg] { (*pkg)(); });
   }
   cvs_[gpu_idx].notify_one();
   return fut;
@@ -130,7 +137,9 @@ void TPTransferThreadGroup::tp_group_transfer(
   std::vector<std::future<void>> futures;
   futures.reserve(num_gpus_);
 
-  for (int i=0; i<num_gpus_; ++i){
+  int numa_node_count = cpu_blocks_ptrs_.size();
+
+  for (int i = 0; i < num_gpus_; ++i) {
     futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
       try {
         int num_blocks = gpu_block_id_tensor.numel();
@@ -142,29 +151,34 @@ void TPTransferThreadGroup::tp_group_transfer(
             static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
         void **gpu_layer_ptrs =
             static_cast<void **>(gpu_blocks_ + i * num_layers + layer_id);
-        void *cpu_ptr = cpu_blocks_;
+
+        // we assume the topology is numa0 -> gpu 0,1,2,3, numa1 -> gpu 4,5,6,7
+        void *cpu_ptr = cpu_blocks_ptrs_[i / numa_node_count];
         int64_t cpu_startoff_inside_chunks = i * gpu_chunk_sizes_in_bytes_[i];
         if (is_mla && !is_host_to_device) {
-          cpu_startoff_inside_chunks = i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_;
+          cpu_startoff_inside_chunks =
+              i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_;
         } else if (is_mla && is_host_to_device) {
           cpu_startoff_inside_chunks = 0;
         }
-        int64_t gpu_startoff_inside_chunks = 
-            is_mla && !is_host_to_device ? i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_ : 0;
+        int64_t gpu_startoff_inside_chunks =
+            is_mla && !is_host_to_device
+                ? i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_
+                : 0;
         // we assume that the chunk size is the same for all gpus,
         // even if they have different number of gpu_blocks
-        int64_t chunk_size = is_mla && !is_host_to_device ? 
-            gpu_chunk_sizes_in_bytes_[i] / num_gpus_ : gpu_chunk_sizes_in_bytes_[i];
-      
+        int64_t chunk_size = is_mla && !is_host_to_device
+                                 ? gpu_chunk_sizes_in_bytes_[i] / num_gpus_
+                                 : gpu_chunk_sizes_in_bytes_[i];
+
         flexkv::transfer_kv_blocks(
-          num_blocks, layer_id, layer_granularity, gpu_block_ids,
-          gpu_layer_ptrs, gpu_kv_strides_in_bytes_[i], gpu_block_strides_in_bytes_[i],
-          gpu_startoff_inside_chunks,
-          cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
-          cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
-          cpu_startoff_inside_chunks, chunk_size, streams_[i],
-          transfer_sms, is_host_to_device, use_ce_transfer, is_mla
-        );
+            num_blocks, layer_id, layer_granularity, gpu_block_ids,
+            gpu_layer_ptrs, gpu_kv_strides_in_bytes_[i],
+            gpu_block_strides_in_bytes_[i], gpu_startoff_inside_chunks,
+            cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
+            cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
+            cpu_startoff_inside_chunks, chunk_size, streams_[i], transfer_sms,
+            is_host_to_device, use_ce_transfer, is_mla);
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
@@ -175,11 +189,10 @@ void TPTransferThreadGroup::tp_group_transfer(
         failed = true;
         error_msg = e.what();
       }
-
     }));
   }
 
-  for (auto &f : futures){
+  for (auto &f : futures) {
     f.get();
   }
 

@@ -405,7 +405,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  finished_ops_queue: MPQueue,
                  op_buffer_tensor: torch.Tensor,
                  gpu_blocks: List[List[TensorSharedHandle]],
-                 cpu_blocks: torch.Tensor,
+                 cpu_blocks_list: List[torch.Tensor],
                  gpu_kv_layouts: List[KVCacheLayout],
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
@@ -433,7 +433,15 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self.tp_group_size = tp_group_size
         self.dp_group_id = dp_group_id
 
-        cudaHostRegister(cpu_blocks)
+        self.enable_numa_aware = len(cpu_blocks_list) == 2
+        if self.enable_numa_aware:
+            if len(cpu_blocks_list) > 2:
+                raise ValueError("Only 2 numa nodes are supported for numa aware transfer")
+            if self.is_mla:
+                raise ValueError("MLA is not supported for numa aware transfer")
+
+        for cpu_blocks in cpu_blocks_list:
+            cudaHostRegister(cpu_blocks)
 
         self.num_layers = gpu_kv_layouts[0].num_layer
         gpu_kv_layouts_per_layer = [gpu_kv_layout.div_layer(self.num_layers) for gpu_kv_layout in gpu_kv_layouts]
@@ -462,9 +470,15 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         gpu_block_strides_tensor = torch.tensor(self.gpu_block_strides_in_bytes, dtype=torch.int64)
         gpu_chunk_sizes_tensor = torch.tensor(self.gpu_chunk_sizes_in_bytes, dtype=torch.int64)
 
-        self.tp_transfer_thread_group = TPTransferThreadGroup(self.num_gpus, self.gpu_blocks, cpu_blocks, dp_group_id,
-                                                              gpu_kv_strides_tensor, gpu_block_strides_tensor, gpu_chunk_sizes_tensor)
-
+        self.tp_transfer_thread_group = TPTransferThreadGroup(
+            self.num_gpus,
+            self.gpu_blocks,
+            cpu_blocks_list,
+            dp_group_id,
+            gpu_kv_strides_tensor,
+            gpu_block_strides_tensor,
+            gpu_chunk_sizes_tensor,
+        )
 
     def _transfer_impl(self,
                        src_block_ids: torch.Tensor,
@@ -496,7 +510,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
         if len(gpu_block_id_list) == 0:
             return
-        
+
         self.tp_transfer_thread_group.tp_group_transfer(
             gpu_block_id_list,
             cpu_block_id_list,

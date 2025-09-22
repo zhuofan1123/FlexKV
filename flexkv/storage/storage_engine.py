@@ -8,7 +8,10 @@ from flexkv.common.config import ModelConfig, CacheConfig
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import DeviceType
-from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator, RemoteAllocator
+from flexkv.common.numa import get_numa_node_count
+from flexkv.storage.allocator import \
+    CPUAllocator, GPUAllocator, SSDAllocator, RemoteAllocator, CPUNumaAllocator
+from flexkv.common.debug import flexkv_logger
 
 
 class StorageEngine:
@@ -21,6 +24,13 @@ class StorageEngine:
         self._cache_config = cache_config
         if not self._cache_config.gpu_kv_layout_type == KVCacheLayoutType.LAYERWISE:
             raise ValueError("Only layerwise layout is supported for GPU")
+
+        self.enable_numa_aware = model_config.tp_size == 8 and not model_config.use_mla \
+            and cache_config.enable_cpu and not cache_config.enable_ssd and not cache_config.enable_remote \
+            and get_numa_node_count() == 2
+        if self.enable_numa_aware:
+            flexkv_logger.info(f"{get_numa_node_count()} NUMA nodes detected, enabling numa aware")
+
         if self._cache_config.enable_cpu:
             self._cpu_layout: Optional[KVCacheLayout] = KVCacheLayout(
                 type=self._cache_config.cpu_kv_layout_type,
@@ -31,11 +41,30 @@ class StorageEngine:
                 head_size=self._model_config.head_size,
                 is_mla=self._model_config.use_mla
             )
-            self.allocate(
-                device_type=DeviceType.CPU,
-                layout=self._cpu_layout,
-                dtype=self._model_config.dtype,
-            )
+            if self.enable_numa_aware:
+                try:
+                    self.allocate(
+                        device_type=DeviceType.CPU,
+                        layout=self._cpu_layout,
+                        dtype=self._model_config.dtype,
+                        enable_numa_aware=self.enable_numa_aware
+                    )
+                except Exception as e:
+                    flexkv_logger.warning(f"Failed to allocate CPU blocks with numa aware: {e}, disabling numa aware")
+                    self.enable_numa_aware = False
+                    self.allocate(
+                        device_type=DeviceType.CPU,
+                        layout=self._cpu_layout,
+                        dtype=self._model_config.dtype,
+                        enable_numa_aware=False
+                    )
+            else:
+                self.allocate(
+                    device_type=DeviceType.CPU,
+                    layout=self._cpu_layout,
+                    dtype=self._model_config.dtype,
+                    enable_numa_aware=False
+                )
         if self._cache_config.enable_ssd:
             if not self._cache_config.ssd_kv_layout_type == self._cpu_layout.type:
                 raise ValueError(f"SSD layout type must be the same as CPU layout type: {self._cpu_layout.type}")
@@ -117,6 +146,7 @@ class StorageEngine:
         storage_handle: StorageHandle
         if device_type == DeviceType.CPU:
             pin_memory = kwargs.get('pin_memory', False)
+            enable_numa_aware = kwargs.get('enable_numa_aware', False)
             if raw_data is not None:
                 assert isinstance(raw_data, torch.Tensor), \
                     "raw_data for CPUAllocator must be Tensor"
@@ -125,6 +155,11 @@ class StorageEngine:
                     layout=layout,
                     dtype=dtype,
                     pin_memory=pin_memory
+                )
+            elif enable_numa_aware:
+                storage_handle = CPUNumaAllocator.allocate(
+                    layout=layout,
+                    dtype=dtype,
                 )
             else:
                 storage_handle = CPUAllocator.allocate(

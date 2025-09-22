@@ -1,6 +1,6 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES.
+ * All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,21 +19,20 @@
 #include <atomic>
 #include <condition_variable>
 #include <cuda_runtime.h>
+#include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <thread>
 #include <torch/extension.h>
 #include <vector>
-#include <condition_variable>
-#include <queue>
-#include <functional>
-#include <future>
 namespace flexkv {
 class TPTransferThreadGroup {
 public:
   TPTransferThreadGroup(
       int num_gpus, const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
-      torch::Tensor &cpu_blocks, int dp_group_id,
+      const std::vector<torch::Tensor> &cpu_blocks_list, int dp_group_id,
       torch::Tensor &gpu_kv_strides_tensor,
       torch::Tensor &gpu_block_strides_tensor,
       torch::Tensor &gpu_chunk_sizes_tensor);
@@ -56,7 +55,7 @@ private:
   int num_gpus_;
   int dp_group_id_;
   void **gpu_blocks_;
-  void *cpu_blocks_;
+  std::vector<void *> cpu_blocks_ptrs_;
 
   int64_t *gpu_kv_strides_in_bytes_;
   int64_t *gpu_block_strides_in_bytes_;

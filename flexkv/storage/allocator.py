@@ -12,6 +12,7 @@ import torch
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, AccessHandleType, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.numa import get_numa_node_count, create_tensor_with_numa_bind
 
 
 class BaseStorageAllocator(ABC):
@@ -121,12 +122,47 @@ class CPUAllocator(BaseStorageAllocator):
                       layout: KVCacheLayout,
                       dtype: torch.dtype,
                       **kwargs: Any) -> StorageHandle:
+        raise NotImplementedError
+
+class CPUNumaAllocator(BaseStorageAllocator):
+    @classmethod
+    def allocate(cls,
+                 layout: KVCacheLayout,
+                 dtype: torch.dtype,
+                 **kwargs: Any) -> StorageHandle:
+        total_size = layout.get_total_elements()
+        num_numa_nodes = get_numa_node_count()
+        if total_size % num_numa_nodes != 0:
+            raise ValueError(f"total_size ({total_size}) must be a multiple of "
+                             f"num_numa_nodes ({num_numa_nodes})")
+        total_size_per_node = total_size // num_numa_nodes
+        physical_chunks = []
+        for node in range(num_numa_nodes):
+            physical_chunks.append(
+                create_tensor_with_numa_bind(
+                    node=node,
+                    shape=[total_size_per_node],
+                    dtype=dtype,
+                )
+            )
         return StorageHandle(
             handle_type=AccessHandleType.TENSOR,
-            data=data,
+            data=physical_chunks,
             kv_layout=layout,
             dtype=dtype,
         )
+
+    @classmethod
+    def free(cls, accessible_handle: StorageHandle) -> None:
+        pass
+
+    @classmethod
+    def from_raw_data(cls,
+                      data: List[torch.Tensor],  # type: ignore
+                      layout: KVCacheLayout,
+                      dtype: torch.dtype,
+                      **kwargs: Any) -> StorageHandle:
+        raise NotImplementedError
 
 class SSDAllocator(BaseStorageAllocator):
     @classmethod

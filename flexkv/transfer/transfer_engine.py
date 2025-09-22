@@ -123,8 +123,9 @@ class TransferEngine:
                     op_buffer_tensor = self.pin_buffer.get_buffer(),
                     gpu_blocks=[self.gpu_handles[j].get_tensor_handle_list() \
                                 for j in range(i * self.tp_size, (i + 1) * self.tp_size)],
-                    cpu_blocks=self._cpu_handle.get_tensor(),
-                    gpu_kv_layouts=[self.gpu_handles[i].kv_layout for i in range(i * self.tp_size, (i + 1) * self.tp_size)],
+                    cpu_blocks_list=self._cpu_handle.get_tensor_list(),
+                    gpu_kv_layouts=[self.gpu_handles[i].kv_layout \
+                        for i in range(i * self.tp_size, (i + 1) * self.tp_size)],
                     cpu_kv_layout=self._cpu_handle.kv_layout,
                     dtype=self.gpu_handles[i].dtype,
                     tp_group_size=self.tp_size,
