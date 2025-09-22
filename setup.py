@@ -29,6 +29,7 @@ cpp_sources = [
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
+    "csrc/numa_utils.cpp",
 ]
 
 hpp_sources = [
@@ -36,9 +37,10 @@ hpp_sources = [
     "csrc/tp_transfer_thread_group.h",
     "csrc/transfer_ssd.h",
     "csrc/radix_tree.h",
+    "csrc/numa_utils.h",
 ]
 
-extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
+extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring", "-lnuma"]
 extra_compile_args = ["-std=c++17"]
 include_dirs = [os.path.abspath(os.path.join(build_dir, "include"))]
 
