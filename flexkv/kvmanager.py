@@ -186,7 +186,7 @@ class KVManager:
             return self.dp_client.launch_tasks(task_ids, slot_mappings, as_batch)
         else:
             return self.kv_task_engine.launch_tasks(task_ids, slot_mappings, as_batch)
-            
+
     def cancel(self, task_ids: Union[int, List[int]]) -> None:
         if isinstance(task_ids, int):
             task_ids = [task_ids]

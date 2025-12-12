@@ -522,14 +522,14 @@ class FlexKVWorkerConnector:
         self.is_local_leader = get_tp_group().local_rank == 0
         self.launch_remote_transfer_manager = get_tp_group().local_rank == 0 and \
             get_tp_group().rank_in_group != 0
-        current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.model_config.tp_size
+        logical_device_id = torch.cuda.current_device()
         self.flexkv_config = flexkv_config
         if self.launch_remote_transfer_manager:
             self.remote_transfer_manager_process = TransferManagerOnRemote.create_process()
 
-        logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, \
-            dp_client_id: {dp_client_id}")
-        self.tp_client = KVTPClient(flexkv_config.gpu_register_port, dp_client_id, current_device_id)
+        logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, "
+                    f"dp_client_id: {dp_client_id}, logical_device_id: {logical_device_id}")
+        self.tp_client = KVTPClient(flexkv_config.gpu_register_port, dp_client_id, logical_device_id)
         logger.info("Finish init FlexKVWorkerConnector")
 
     def register_to_server(self, kv_caches: dict[str, torch.Tensor]):

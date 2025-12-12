@@ -227,30 +227,76 @@ class KVTPClient:
         )
 
         self.dp_client_id = dp_client_id
+        # Convert logical device ID to physical device ID
         self.device_id = device_id
 
         flexkv_logger.info(f"KVTPClient {device_id} of KVDPClient {self.dp_client_id} Initialized!")
+
+    @staticmethod
+    def _get_physical_device_id(logical_device_id: int) -> int:
+        """Convert logical device ID to physical device ID.
+
+        When CUDA_VISIBLE_DEVICES is set, PyTorch sees a subset of GPUs with
+        remapped IDs (0, 1, 2...). This function maps the logical ID back to
+        the actual physical GPU ID.
+
+        Args:
+            logical_device_id: The logical device ID from torch.cuda.current_device()
+
+        Returns:
+            The physical device ID that can be used for CUDA IPC
+        """
+        import os
+        cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+
+        if cuda_visible_devices is None or cuda_visible_devices.strip() == '':
+            return logical_device_id
+
+        try:
+            visible_gpus = [int(x.strip()) for x in cuda_visible_devices.split(',') if x.strip()]
+            if logical_device_id < len(visible_gpus):
+                physical_id = visible_gpus[logical_device_id]
+                flexkv_logger.debug(
+                    f"CUDA_VISIBLE_DEVICES={cuda_visible_devices}, "
+                    f"mapping logical device {logical_device_id} -> physical device {physical_id}"
+                )
+                return physical_id
+            else:
+                flexkv_logger.warning(
+                    f"Logical device ID {logical_device_id} out of range for "
+                    f"CUDA_VISIBLE_DEVICES={cuda_visible_devices}, using as-is"
+                )
+                return logical_device_id
+        except ValueError as e:
+            flexkv_logger.warning(
+                f"Failed to parse CUDA_VISIBLE_DEVICES={cuda_visible_devices}: {e}, "
+                f"using logical device ID {logical_device_id} as-is"
+            )
+            return logical_device_id
 
     def register_to_server(
         self,
         kv_caches: List[torch.Tensor],
         kv_layout: KVCacheLayout,
-        override_device_id: Optional[int] = None,
     ) -> None:
         if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
 
-        # Use override_device_id if provided, otherwise use self.device_id
-        device_id = override_device_id if override_device_id is not None else self.device_id
+        device_id = kv_caches[0].device.index
+
+        physical_device_id = self._get_physical_device_id(device_id)
+
+        if device_id != physical_device_id:
+            flexkv_logger.debug(f"Convert logical device {device_id} -> physical device {physical_device_id}")
 
         handles = []
         for _, tensor in enumerate(kv_caches):
-            handle = TensorSharedHandle(tensor, device_id)
+            handle = TensorSharedHandle(tensor, physical_device_id)
             handles.append(handle)
 
         register_req = RegisterTPClientRequest(
             self.dp_client_id,
-            device_id,
+            physical_device_id,
             handles,
             kv_layout
         )

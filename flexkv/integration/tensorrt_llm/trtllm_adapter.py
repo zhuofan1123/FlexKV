@@ -31,7 +31,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
     def __init__(self, config: ExecutorConfig):
         # Set environment variable for FlexKV with TensorRT-LLM，this must before KVManager initialization
         os.environ['FLEXKV_WITH_TRTLLM'] = '1'
-        flexkv_config = FlexKVConfig.from_env() 
+        flexkv_config = FlexKVConfig.from_env()
         flexkv_config.post_init_from_trt_config(config)
         self.node_rank, self.tp_rank, self.dp_rank = get_rank_info_from_trt_config(config)
 
@@ -61,7 +61,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         self.flexkv_stats = FlexKVStats(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', 200))
 
         flexkv_logger.info("Finish init FlexKVSchedulerConnector")
-        
+
     def is_ready(
         self,
     ) -> bool:
@@ -78,8 +78,8 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
     ####################
     #### Get Method ####
     ####################
-    
-    def get_num_new_matched_tokens( 
+
+    def get_num_new_matched_tokens(
         self,
         _request: "LlmRequest",
         num_computed_tokens: int,
@@ -98,7 +98,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         request = RequestWrapper(_request)
         task_id, num_new_matched_tokens = self._get_match(_request=_request,
                                                           num_computed_tokens=num_computed_tokens)
-        
+
         self.flexkv_stats.record_get(num_prompt_tokens=request.num_prompt_tokens,
                                      num_gpu_matched_tokens=num_computed_tokens,
                                      num_flexkv_matched_tokens=num_new_matched_tokens)
@@ -128,7 +128,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         """
         request = RequestWrapper(_request)
         flexkv_logger.info(f"Get match request: {request}")
-        
+
         match_start_time = time.perf_counter()
         num_tokens_to_get = (request.num_prompt_tokens // self.block_size) * self.block_size
         if num_tokens_to_get == 0:
@@ -210,7 +210,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         """
         request = RequestWrapper(_request)
         if request.num_new_matched_tokens == 0:
-            flexkv_logger.info(f"No new matched tokens, skip update state after alloc.")
+            flexkv_logger.info("No new matched tokens, skip update state after alloc.")
             return
 
         # prepare to launch task
@@ -245,7 +245,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
             bool: whether thire is unfinished task for this request.
         """
         request = RequestWrapper(_request)
-        
+
         # Task not finished, can't free blocks
         if request.req_id in self.req_id_to_task_dict:
             return True
@@ -274,7 +274,8 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         block_ids_to_put = block_ids[num_matched_blocks:num_matched_blocks+num_unmatched_blocks]
         flexkv_logger.info(f"{num_matched_blocks=}, {num_matched_blocks+num_unmatched_blocks=}, {len(block_ids)=}")
         task.slot_mapping = np.array(block_ids_to_put).repeat(self.block_size)*self.block_size
-        flexkv_logger.info(f"{task_id=}, {num_matched_tokens=}, {num_unmatched_tokens=}, {len(block_ids_to_put)=}, {self.block_size=}, {task.slot_mapping.shape=}")
+        flexkv_logger.info(f"{task_id=}, {num_matched_tokens=}, {num_unmatched_tokens=}, "
+                           f"{len(block_ids_to_put)=}, {self.block_size=}, {task.slot_mapping.shape=}")
         return True
 
     def _put_match(
@@ -313,7 +314,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         # Auto cancel if not need to put.
         match_end_time = time.perf_counter()
         flexkv_logger.debug(f"Put match cost {(match_end_time-match_start_time)*1000:.2f} ms. {num_unmatched_tokens=}")
-        
+
         if num_unmatched_tokens > 0:
             self.req_id_to_task_dict[request.req_id] = task_id
             self.tasks_to_cancel[task_id] = FlexKVPutTask(task_id=task_id,
@@ -349,7 +350,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
     #######################
     #### Common Method ####
     #######################
-    
+
     def cancel_tasks(self) -> None:
         """
         Cancel tasks in self.cancel_tasks.
@@ -362,7 +363,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
             flexkv_logger.info(f"FlexKV Cancel task: {task}")
         self.flexkv_manager.cancel(task_ids=list(self.tasks_to_cancel.keys()))
         self.tasks_to_cancel.clear()
-    
+
     def launch_tasks(self) -> None:
         """
         Launch tasks in self.unlaunched_tasks
@@ -454,10 +455,7 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
             finished_sending=list(finished_sending),
             finished_recving=list(finished_recving))
         return metadata
-    
-    @property
-    def dp_client_id(self) -> int:
-        return self.flexkv_manager.dp_client_id
+
 
 class FlexKVWorkerConnector(KvCacheConnectorWorker):
     def __init__(self, config: ExecutorConfig):
@@ -465,29 +463,31 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         self.node_rank, self.tp_rank, self.dp_rank = get_rank_info_from_trt_config(config)
         flexkv_config.post_init_from_trt_config(config)
         dp_client_id = self.dp_rank
-        
-        current_device_id = torch.cuda.current_device() + dp_client_id * flexkv_config.model_config.tp_size
+
+        logical_device_id = torch.cuda.current_device()
         self.flexkv_config = flexkv_config
-        
+
         # For multi-node TP on remote node (node B), worker0 needs to create TransferManagerOnRemote process
         self.remote_process = None
         if self._need_to_create_remote_process():
-            flexkv_logger.info("Multi-node TP detected on remote node, worker0 creating TransferManagerOnRemote process")
+            flexkv_logger.info("Detected multi-node TP on remote node, "
+                               "worker0 is creating TransferManagerOnRemote process")
             self.remote_process = TransferManagerOnRemote.create_process()
             flexkv_logger.info(f"TransferManagerOnRemote process created, PID: {self.remote_process.pid}")
-        
-        flexkv_logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, dp_client_id: {dp_client_id}")
-        self.tp_client = KVTPClient(flexkv_config.gpu_register_port, dp_client_id, current_device_id)
+
+        flexkv_logger.info(f"Start init FlexKVWorkerConnector to {flexkv_config.gpu_register_port}, "
+                          f"dp_client_id: {dp_client_id}, logical_device_id: {logical_device_id}")
+        self.tp_client = KVTPClient(flexkv_config.gpu_register_port, dp_client_id, logical_device_id)
         flexkv_logger.info("Finish init FlexKVWorkerConnector")
-    
+
     def _need_to_create_remote_process(self) -> bool:
         """Check if need to create TransferManagerOnRemote process.
-        
+
         Returns True when all of the following conditions are met:
         - Multi-node TP is detected (tp_size > gpus_per_node)
         - Current node is not master node (node_rank > 0)
         - Current worker is worker0 in TP group (tp_rank == 0)
-        
+
         Returns:
             bool: True if need to create TransferManagerOnRemote process, False otherwise.
         """
@@ -496,7 +496,7 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
             is_first_worker = self.tp_rank % 8 == 0
             is_multinode_tp = self.flexkv_config.model_config.tp_size > torch.cuda.device_count()
             flexkv_logger.info(f"{is_master_node=}, {is_first_worker=}, {is_multinode_tp=}")
-            
+
             return is_multinode_tp and not is_master_node and is_first_worker
         except Exception as e:
             flexkv_logger.error(f"Failed to get node info from flexkv_config: {e}")
@@ -506,36 +506,18 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
         # vllm kv_caches: dict[str, torch.Tensor]
         # trt kv_caches: torch.Tensor
-        
+
         # shepe = ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
-        # 1. mNumPrimaryBlocks{blocksInPrimaryPool}            blocksInPrimaryPool = tc::ceilDiv(maxTokens, tokensPerBlock);
+        # 1. mNumPrimaryBlocks{blocksInPrimaryPool}       blocksInPrimaryPool = tc::ceilDiv(maxTokens, tokensPerBlock);
         # 2. layer_num
         # 3. mKVFactor{mCacheType == CacheType::kSELFKONLY ? 1 : 2}
         # 4. blockSize((numKvHeads * sizePerHead * tokensPerBlock) / quantSize)
-    
+
         flexkv_logger.info(f"Start register kv_caches, shape: {kv_cache_tensor.shape}")
-        
-        # Get actual device from tensor (more reliable in MPI environment)
-        logical_device_id = kv_cache_tensor.device.index
-        flexkv_logger.debug(f"Tensor is on device: {kv_cache_tensor.device}, logical device.index={logical_device_id}")
-        flexkv_logger.debug(f"self.tp_client.device_id (from init): {self.tp_client.device_id}")
-        
-        # Get physical GPU ID (in case CUDA_VISIBLE_DEVICES is set)
-        cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
-        if cuda_visible_devices:
-            # Map logical ID to physical ID
-            visible_gpus = [int(x) for x in cuda_visible_devices.split(',')]
-            physical_device_id = visible_gpus[logical_device_id] if logical_device_id < len(visible_gpus) else logical_device_id
-            flexkv_logger.debug(f"CUDA_VISIBLE_DEVICES={cuda_visible_devices}, mapping logical {logical_device_id} -> physical {physical_device_id}")
-        else:
-            physical_device_id = logical_device_id
-            flexkv_logger.debug(f"No CUDA_VISIBLE_DEVICES set, using logical device ID {logical_device_id}")
-        
-        # Use physical device ID for registration
-        correct_device_id = physical_device_id
-        
+
         if self.flexkv_config.model_config.use_mla:
-            assert kv_cache_tensor.ndim == 4, (f"expect kv cached tensor has 4 dim but get shape={kv_cache_tensor.shape}")
+            assert kv_cache_tensor.ndim == 4, \
+                (f"expect kv cached tensor has 4 dim but get shape={kv_cache_tensor.shape}")
 
         num_blocks = kv_cache_tensor.shape[0]
         num_layers = kv_cache_tensor.shape[1]
@@ -545,9 +527,9 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
         head_size = self.flexkv_config.model_config.head_size
         if self.flexkv_config.model_config.use_mla:
             assert kv_dim == 1, (f"expect kv_dim eqals to 1 when using MLA but get kv_dim={kv_dim}")
-        
-        gpu_blocks = [kv_cache_tensor] # convert to list for flexkv register 
- 
+
+        gpu_blocks = [kv_cache_tensor] # convert to list for flexkv register
+
         gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.BLOCKFIRST,
             num_layer=num_layers,
@@ -558,33 +540,32 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
             is_mla=self.flexkv_config.model_config.use_mla,
         )
         flexkv_logger.info(f"gpu_layout: {gpu_layout}")
-        # Use correct device_id from tensor's actual device
-        self.tp_client.register_to_server(gpu_blocks, gpu_layout, override_device_id=correct_device_id)
-        flexkv_logger.info(f"Finish register kv_caches on device {correct_device_id}")
+        self.tp_client.register_to_server(gpu_blocks, gpu_layout)
+        flexkv_logger.info(f"Finish register kv_caches on device {self.tp_client.device_id}")
 
     def start_load_kv(self, stream: torch.cuda.Stream):
         return
-        
+
     def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream):
         return
-    
+
     def save_kv_layer(self, layer_idx: int, stream: torch.cuda.Stream):
         return
 
     def wait_for_save(self, stream: torch.cuda.Stream):
         return
-    
+
     def get_finished(
             self, finished_gen_req_ids: List[int],
             started_loading_req_ids: List[int]) -> Tuple[List[int], List[int]]:
-        
+
         finished_sending = self._metadata.finished_sending
         finished_recving = self._metadata.finished_recving
         return finished_sending, finished_recving
-    
+
     def shutdown(self) -> None:
         """Shutdown the worker connector and cleanup resources.
-        
+
         For node B worker0, this will shutdown the TransferManagerOnRemote process.
         """
         if hasattr(self, 'remote_process') and self.remote_process is not None:
@@ -611,12 +592,12 @@ class FlexKVWorkerConnector(KvCacheConnectorWorker):
                 flexkv_logger.error(f"Error shutting down TransferManagerOnRemote process: {e}")
             finally:
                 self.remote_process = None
-    
+
     def __del__(self):
         """Cleanup on deletion."""
         if hasattr(self, 'remote_process') and self.remote_process is not None:
             self.shutdown()
-    
+
 def get_rank_info_from_trt_config(config: ExecutorConfig):
     if config.mapping.enable_attention_dp:
         node_rank = config.mapping.node_rank
