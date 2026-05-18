@@ -86,6 +86,18 @@ class TransferOpStatus(Enum):
 class TransferOp:
     _next_op_id: ClassVar[int] = 0
     _lock: ClassVar[threading.Lock] = threading.Lock()
+    # Per-process disjoint range — set by `set_op_id_range()`. Default is the
+    # full int64 positive range, preserving single-CE behavior. The radix-shmem
+    # multi-DP path partitions this so 8 CE procs sharing one TE never collide.
+    _op_id_range_start: ClassVar[int] = 0
+    _op_id_range_end: ClassVar[int] = 1 << 62
+
+    @classmethod
+    def set_op_id_range(cls, start: int, end: int) -> None:
+        with cls._lock:
+            cls._op_id_range_start = start
+            cls._op_id_range_end = end
+            cls._next_op_id = start
 
     op_id: int = field(init=False)
     graph_id: int
@@ -126,8 +138,12 @@ class TransferOp:
                              f"src_block_ids.size={self.src_block_ids.size}, "
                              f"dst_block_ids.size={self.dst_block_ids.size}")
         with TransferOp._lock:
+            if TransferOp._next_op_id < TransferOp._op_id_range_start:
+                TransferOp._next_op_id = TransferOp._op_id_range_start
             self.op_id = TransferOp._next_op_id
             TransferOp._next_op_id += 1
+            if TransferOp._next_op_id >= TransferOp._op_id_range_end:
+                TransferOp._next_op_id = TransferOp._op_id_range_start
         assert self.src_block_ids.dtype == np.int64
         assert self.dst_block_ids.dtype == np.int64
         self.valid_block_num = self.src_block_ids.size
@@ -202,6 +218,12 @@ class LayerwiseTransferOp(TransferOp):
 class TransferOpGraph:
     _next_graph_id = 0
     _lock = threading.Lock()
+    # Per-process DP-aware range, set via set_graph_id_range(start, end). Used
+    # so multiple CE processes that share a single TE don't collide on
+    # graph_id. Default range is the original (0, 2**63), preserving behavior
+    # in the single-CE path.
+    _graph_id_range_start = 0
+    _graph_id_range_end = 1 << 62
 
     def __init__(self) -> None:
         self.graph_id = self._get_graph_id()
@@ -219,9 +241,22 @@ class TransferOpGraph:
     @classmethod
     def _get_graph_id(cls) -> int:
         with cls._lock:
+            if cls._next_graph_id < cls._graph_id_range_start:
+                cls._next_graph_id = cls._graph_id_range_start
             graph_id = cls._next_graph_id
             cls._next_graph_id += 1
+            if cls._next_graph_id >= cls._graph_id_range_end:
+                cls._next_graph_id = cls._graph_id_range_start
             return graph_id
+
+    @classmethod
+    def set_graph_id_range(cls, start: int, end: int) -> None:
+        """Restrict generated graph_ids to [start, end). Used by the
+        radix-shmem multi-DP path to give each CE process a disjoint range."""
+        with cls._lock:
+            cls._graph_id_range_start = start
+            cls._graph_id_range_end = end
+            cls._next_graph_id = start
 
     def set_graph_id(self, graph_id: int) -> None:
         self.graph_id = graph_id
@@ -946,7 +981,7 @@ def merge_to_batch_graph(batch_id: int,
             put_sinks.append(merged_swa_d2h_op.op_id)
         if not put_sinks:
             # No D2H sink: wait for every independent full-KV / SWA leaf
-            # (H2DISK and/or H2REMOTE). 
+            # (H2DISK and/or H2REMOTE).
             for op in (merged_h2disk_op, merged_swa_h2disk_op,
                        merged_h2remote_op, merged_swa_h2remote_op):
                 if op is not None:

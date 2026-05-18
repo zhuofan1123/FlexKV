@@ -1162,6 +1162,79 @@ class TransferManagerMultiNodeHandle(TransferManagerHandleBase):
         flexkv_logger.info("TransferManagerMultiNodeHandle shutdown complete")
 
 
+class TransferManagerShmTEProcess:
+    """Spawns the single TE subprocess for the multi-DP shm path.
+
+    The bootstrap (instance 0, dp 0) creates this; CEs in other DP processes
+    just connect via `TransferManagerHandle(mode="shm", shm_server_id=...,
+    shm_channel_id=...)`.
+    """
+
+    def __init__(self,
+                 model_config: ModelConfig,
+                 cache_config: CacheConfig,
+                 gpu_register_port: str,
+                 server_id: str,
+                 num_channels: int):
+        self.model_config = model_config
+        self.cache_config = cache_config
+        self.gpu_register_port = gpu_register_port
+        self.server_id = server_id
+        self.num_channels = num_channels
+
+        self.mp_ctx = mp.get_context("spawn")
+        self._start_event = self.mp_ctx.Event()
+        self._ready_event = self.mp_ctx.Event()
+        self._stop_event = self.mp_ctx.Event()
+        self.process: Optional[Process] = None
+
+    def start(self) -> None:
+        if self.process is not None and self.process.is_alive():
+            return
+        from flexkv.transfer.shm_channel_handle import te_shm_main
+        # CRITICAL: clear CUDA_VISIBLE_DEVICES in the TE subprocess. The
+        # parent (scheduler) may have it restricted to a single GPU (its DP
+        # rank's device), but the TE needs to cudaIpcOpenMemHandle from ALL
+        # DPs' GPUs. mp.Process(spawn) inherits env from parent unless we
+        # override. Save+restore around .start().
+        _saved_cuda = os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        try:
+            self.process = self.mp_ctx.Process(
+                target=te_shm_main,
+                args=(self.model_config,
+                      self.cache_config,
+                      self.gpu_register_port,
+                      self.server_id,
+                      self.num_channels,
+                      self._start_event,
+                      self._ready_event,
+                      self._stop_event),
+                daemon=False,
+            )
+            self.process.start()
+        finally:
+            if _saved_cuda is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = _saved_cuda
+        self._start_event.wait()
+        flexkv_logger.info(
+            f"TransferManagerShmTEProcess started, PID={self.process.pid}, "
+            f"server_id={self.server_id}, channels={self.num_channels}"
+        )
+
+    def is_ready(self) -> bool:
+        return self._ready_event.is_set()
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        if self.process is None:
+            return
+        self._stop_event.set()
+        self.process.join(timeout=timeout)
+        if self.process.is_alive():
+            self.process.terminate()
+            self.process.join()
+        self.process = None
+
+
 class TransferManagerHandle:
     def __init__(self,
                  model_config: ModelConfig,
@@ -1190,8 +1263,22 @@ class TransferManagerHandle:
             self._handle: TransferManagerHandleBase = TransferManagerMultiNodeHandle(
                 model_config, cache_config, gpu_register_port, master_host, master_ports
             )
+        elif mode == "shm":
+            # Multi-DP path: each CE process gets a dedicated ShmChannel to a
+            # single TE subprocess. The TE is created by the bootstrap process
+            # via TransferManagerShmTEProcess; clients attach by server_id.
+            from flexkv.transfer.shm_channel_handle import (
+                TransferManagerShmChannelHandle,
+            )
+            server_id = kwargs["shm_server_id"]
+            channel_id = kwargs["shm_channel_id"]
+            self._handle: TransferManagerHandleBase = TransferManagerShmChannelHandle(
+                model_config, cache_config, server_id, channel_id
+            )
         else:
-            raise ValueError(f"Invalid mode: {mode}, must be process, thread or remote")
+            raise ValueError(
+                f"Invalid mode: {mode}, must be process, thread, remote, or shm"
+            )
 
     def start(self) -> None:
         self._handle.start()

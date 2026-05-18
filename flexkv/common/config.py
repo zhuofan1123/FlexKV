@@ -744,6 +744,14 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     server_client_mode=bool(int(os.getenv('FLEXKV_SERVER_CLIENT_MODE', 0))),
     server_recv_port=os.getenv('FLEXKV_SERVER_RECV_PORT', 'ipc:///tmp/flexkv_server'),
 
+    # Multi-DP via radixshmem (cache_engine in each DP scheduler proc, single TE
+    # via shm channel IPC). When True, KVServer is not started; each DP process
+    # builds its own KVTaskEngine and attaches to shared radix regions.
+    radix_shmem=bool(int(os.getenv('FLEXKV_RADIX_SHMEM', 0))),
+    # Identifier used to name radix shm regions and TE shm channels. Lets
+    # multiple FlexKV instances coexist on a host.
+    shm_radix_server_id=os.getenv('FLEXKV_SHM_RADIX_ID', 'default'),
+
     index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
     cpu_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_CPU_LAYOUT', 'BLOCKFIRST').upper()),
     ssd_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_SSD_LAYOUT', 'BLOCKFIRST').upper()),
