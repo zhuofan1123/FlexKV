@@ -4,7 +4,7 @@ Bootstrap for radixshmem-backed CacheEngine.
 
 Per-device-type RadixTree (CPU / SSD / REMOTE) lives in its own POSIX shm
 region. The first DP process (instance 0, dp_client_id 0) creates the regions
-via `shmradix.TreeServer`; all others attach via `shmradix.TreeClient`.
+via `shmradix.RadixServer`; all others attach via `shmradix.RadixClient`.
 
 Naming convention:
     /flexkv_radix_{server_id}_{cpu|ssd|remote}
@@ -64,7 +64,7 @@ def enabled_devices(cache_config: CacheConfig) -> Tuple[DeviceType, ...]:
 
 
 class ShmRadixOwners:
-    """Holder for the `TreeServer` instances created in the bootstrap process.
+    """Holder for the `RadixServer` instances created in the bootstrap process.
 
     The owner process must keep these alive for the lifetime of the FlexKV
     server (otherwise the shm regions are torn down). We attach them to a
@@ -72,13 +72,13 @@ class ShmRadixOwners:
     """
 
     def __init__(self) -> None:
-        self.servers: Dict[DeviceType, shmradix.TreeServer] = {}
+        self.servers: Dict[DeviceType, shmradix.RadixServer] = {}
 
-    def add(self, device_type: DeviceType, server: shmradix.TreeServer) -> None:
+    def add(self, device_type: DeviceType, server: shmradix.RadixServer) -> None:
         self.servers[device_type] = server
 
     def shutdown(self) -> None:
-        # TreeServer destructor unlinks the shm region.
+        # RadixServer destructor releases the shm region.
         self.servers.clear()
 
 
@@ -111,19 +111,19 @@ def create_shm_radix_regions(model_config: ModelConfig,
             f"creating shm radix region {name} "
             f"(max_nodes={cfg.max_nodes}, max_blocks={cfg.max_blocks})"
         )
-        owners.add(dt, shmradix.TreeServer(name, cfg))
+        owners.add(dt, shmradix.RadixServer(name, cfg))
     return owners
 
 
 def attach_shm_radix_clients(cache_config: CacheConfig,
                              server_id: str,
                              wait_timeout_s: float = 60.0):
-    """Attach a TreeClient per enabled device type. Polls until the owner
+    """Attach a RadixClient per enabled device type. Polls until the owner
     has created the shm files (since multiple processes may race startup)."""
     if shmradix is None:
         raise ImportError("shmradix not installed")
 
-    clients: Dict[DeviceType, shmradix.TreeClient] = {}
+    clients: Dict[DeviceType, shmradix.RadixClient] = {}
     deadline = time.monotonic() + wait_timeout_s
     pending = list(enabled_devices(cache_config))
     while pending and time.monotonic() < deadline:
@@ -135,7 +135,7 @@ def attach_shm_radix_clients(cache_config: CacheConfig,
                 next_pending.append(dt)
                 continue
             try:
-                clients[dt] = shmradix.TreeClient(name)
+                clients[dt] = shmradix.RadixClient(name)
             except Exception as e:
                 flexkv_logger.debug(f"attach to {name} failed (will retry): {e}")
                 next_pending.append(dt)

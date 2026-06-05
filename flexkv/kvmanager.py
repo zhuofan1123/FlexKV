@@ -143,7 +143,7 @@ class KVManager:
         """Initialize the radix-shmem multi-DP path.
 
         Bootstrap proc (instance 0, dp 0):
-          1. Create radix shm regions (one TreeServer per device type).
+          1. Create radix shm regions (one RadixServer per device type).
           2. Spawn the single TE subprocess (which creates per-CE shm channels).
 
         Other DP procs:
@@ -191,11 +191,11 @@ class KVManager:
             self._shm_te_process.start()
         else:
             # Wait until bootstrap created the shm radix regions before
-            # GlobalCacheEngine tries to attach as TreeClient.
+            # GlobalCacheEngine tries to attach as RadixClient.
             attach_shm_radix_clients(self.cache_config, server_id=server_id)
 
         # GlobalCacheEngine inspects GLOBAL_CONFIG_FROM_ENV.radix_shmem and
-        # constructs CacheEngineRadixShmem (TreeClient) per device type.
+        # constructs CacheEngineRadixShmem (RadixClient) per device type.
         # KVTaskEngine wires up the shm-mode TransferManagerHandle.
         self.kv_task_engine = KVTaskEngine(
             self.model_config, self.cache_config,
