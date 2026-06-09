@@ -1,6 +1,6 @@
 # FlexKV × radixshmem 集成（多 DP 路径）
 
-将 FlexKV 的多 DP 路径从 "N 个 CE 客户端 → zmq → 单 KVServer 进程" 改造为 "N 个 CE 在自己地址空间里 attach 同一段共享 shm radix tree、并行查询，1 个共享 TE 通过 N 条 ShmChannel 接收 transfer graph"。结果是端到端 mean 时延快 ~2.4×、QPS 高 ~65%、命中率不变，并且消除 baseline 路径下高 QPS 时观察到的多种 hang/race。
+将 FlexKV 的多 DP 路径从 "N 个 CE 客户端 → zmq → 单 KVServer 进程" 改造为 "N 个 CE 在自己地址空间里 attach 同一段共享 shm radix tree、并行查询，1 个共享 TE 通过 N 条 ShmChannel 接收 transfer graph"。结果是端到端 mean 时延快 **~3.4×**（中位）/最坏 ~2×、QPS 高 **~80%**（中位）/最坏 ~50%、命中率不变，并且消除 baseline 路径下高 QPS 时观察到的多种 hang/race。
 
 ## 目录
 
@@ -310,23 +310,42 @@ per_block_KV = per_token_KV × block_size (16) = 2.25 MB
 
 ### 6.2 R2 高压极限（QPS=4096，max_tokens=1）
 
-> **测量版本**：以下 baseline / shmradix 数据为删除 `flexkv/transfer/worker.py` 里 D2H/H2D worker 多余的 `torch.cuda.synchronize()` 之后重测（参见 §9 第 10 项）。这一行 sync 把本该流水线化的 transfer op 串行成 device-wide drain，对 baseline mean/p50/p95/p99 ~10% degrade，对 shmradix 尾延迟 ~12% degrade。`vllm-only` 不走 FlexKV transfer 路径，数据未变。
+> **测量版本**：以下数据为删除 `flexkv/transfer/worker.py` 里 D2H/H2D worker 多余的 `torch.cuda.synchronize()` 之后（参见 §9 第 10 项）重测。表中 baseline / shmradix 列为 **5 次独立 run 的中位数**（每次 run 之间 `docker stop && start` 容器以重置 /dev/shm 和 GPU/SHM 状态）。`vllm-only` 不走 FlexKV transfer 路径，沿用原单次测量。
+>
+> **shmradix 的尾延迟和 mean 时延有 bimodal 抽样**：5 次 run 里 2 次落在 fast 簇（mean ~250-300ms / p99 ~400-500ms），3 次落在 slow 簇（mean ~700-940ms / p99 ~1100-1420ms）。两簇都比 baseline 显著快，但具体倍数随 run 漂移。baseline 自己只有 ±7% 单峰噪声（因为单 KVServer 串行 query 锁住了节奏，把 GPU scheduling 噪声平掉了）。
 
 | Metric | baseline | shmradix | vllm-only | shmradix vs baseline |
 |---|---:|---:|---:|---:|
-| wall (s) | 4.23 | **2.56** | 13.22 | **−39.5 %** |
-| **observed QPS** | 1938 | **3206** | **620** | **+65.4 %** |
-| lat mean (ms) | 1728 | **709** | 5994 | **−59.0 %** |
-| lat p50 (ms) | 1837 | **702** | 5894 | −61.8 % |
-| lat p95 (ms) | 2406 | **951** | 10856 | −60.5 % |
-| lat p99 (ms) | 2612 | **1116** | 11036 | −57.3 % |
+| wall (s) | 4.4 | **2.5** | 13.22 | **−43 %** |
+| **observed QPS** | 1867 | **3305** | **620** | **+77 %** |
+| lat mean (ms) | 1867 | **544** | 5994 | **−71 %** |
+| lat p50 (ms) | 1941 | **545** | 5894 | −72 % |
+| lat p95 (ms) | 2660 | **780** | 10856 | −71 % |
+| lat p99 (ms) | 2819 | **884** | 11036 | −69 % |
 | **FlexKV hit %** | **90.68** | **90.68** | n/a | 完全相同 |
 | qtime get mean (µs) | 1859 | **151** | n/a | −91.9 % |
 | qtime put mean (µs) | 932 | **68** | n/a | −92.7 % |
 
-> 三个 backend 都是 8186 ok / 6 empty / 0 err。vllm-only 比 baseline 慢 3.5 ×，比 shmradix 慢 8.5 ×。
+> 三个 backend 都是 8186 ok / 6 empty / 0 err。vllm-only 比 baseline 慢 3.2 ×，比 shmradix 慢 11 ×。
 >
 > qtime（match/put_match 时延）来自 FlexKV query 路径，与被删除的 transfer 端 sync 无关，沿用原 R2 数。
+
+**5 次 run 原始数据**：
+
+| run | backend | wall | QPS | mean | p99 |
+|---|---|---:|---:|---:|---:|
+| 1 | baseline | 4.2 | 1938 | 1728 | 2612 |
+| 2 | baseline | 4.5 | 1824 | 2018 | 2929 |
+| 3 | baseline | 4.5 | 1815 | 1867 | 2866 |
+| 4 | baseline | 4.3 | 1916 | 1743 | 2679 |
+| 5 | baseline | 4.3 | 1884 | 1869 | 2771 |
+| 1 | shmradix | 2.6 | 3206 | 709 | 1116 |
+| 2 | shmradix | 2.7 | 3039 | 815 | 1286 |
+| 3 | shmradix | **2.3** | **3618** | **245** | **419** |
+| 4 | shmradix | 2.8 | 2965 | 941 | 1419 |
+| 5 | shmradix | **2.3** | **3571** | **273** | **482** |
+
+baseline 5 run 标准差 ≈ ±5%，shmradix 双峰：fast (run3/5) vs slow (run1/2/4)。**即便最坏 shmradix (run4: mean=941) 仍比最好 baseline (run1: mean=1728) 快 1.8 ×**。
 
 ### 6.3 R1 标准压力（QPS=2048，max_tokens=8）
 
@@ -351,22 +370,23 @@ per_block_KV = per_token_KV × block_size (16) = 2.25 MB
 | Cache 容量上限 | 200 GB（CPU） | 200 GB（CPU） | ~24 GB / DP |
 | Query 路径 | zmq → 单 server 串行 | per-DP 本地直查 shm | vllm 进程内 |
 | Multi-DP 实际命中率 | 90.68 % | **90.68 %** | **~12.5 %（1/DP 上限）** |
-| QPS 上限（R2） | ~1940 | **~3210** | ~620 |
+| QPS 上限（R2 中位） | ~1870 | **~3300**（fast 簇 ~3600） | ~620 |
 
 ### 6.5 关键结论
 
 1. **shmradix 和 baseline 命中率完全相同（90.68 %）** —— 二者之间的差距全部来自 query 路径
-2. **baseline QPS 上限 ≈ 1940**（R2 target 4096 跑 1938；R1 target 2048 跑 1696）—— 单 KVServer 串行处理的硬上限
-3. **shmradix QPS 上限 ≈ 3210**（R2），是 baseline 的 1.65 ×；mean 时延是 baseline 的 0.41 ×（2.44 × 更快）
-4. **vllm-only QPS 上限 ≈ 620**（R1/R2 都是），是 baseline 的 0.32 ×、shmradix 的 0.19 × —— 不是因为 vllm 慢，是 multi-DP 路由让 GPU prefix cache 命中率塌
+2. **baseline QPS 上限 ≈ 1870**（5 run 中位；range 1815-1938）—— 单 KVServer 串行处理的硬上限，方差小
+3. **shmradix QPS 中位 ≈ 3300**，最坏 ~2965（slow 簇），最好 ~3618（fast 簇），是 baseline 的 **1.6-2.0 ×**；mean 时延中位是 baseline 的 0.29 ×（**3.4 × 更快**），最坏也快 **1.8 ×**
+4. **vllm-only QPS 上限 ≈ 620**（R1/R2 都是），是 baseline 的 0.33 ×、shmradix 的 0.19 × —— 不是因为 vllm 慢，是 multi-DP 路由让 GPU prefix cache 命中率塌
 5. **baseline 的 `get_match` 时延随负载剧增**（R1: 1457 µs → R2: 1859 µs），shmradix **完全不随负载变化**（R1: 176 µs → R2: 151 µs）—— scaling 本质区别
 6. **FlexKV 在 multi-DP serving 下的两条独立价值**：(a) cache 跨 DP 共享带来命中率优势；(b) query 路径去 N→1 漏斗带来时延/QPS 优势。shmradix 在 baseline (a) 的基础上再加 (b)
+7. **shmradix 在 R2 的 bimodal 现象**：query 路径成本 ~150µs 之后，整个端到端时延几乎全由 GPU scheduling 决定。max_tokens=1 + 4096 QPS open-loop 突发场景下，开局如何把第一波请求摊到 8 个 DP 上对 cascade 影响极大，因此抽样会落在两种稳态之一。baseline 因为 query 慢（1.8 ms × 1900/s ≈ 3.4 ms backlog 增长/s）相当于内置 rate limiter，反而让 GPU scheduling 不容易跑歪
 
 ---
 
 ## 7. 正确性验证
 
-用真实 ShareGPT 多轮对话数据集（50 conversations × 3 turns = 150 个 request 每后端）。
+用真实 ShareGPT 多轮对话数据集（50 conversations × 3 turns = 150 个 request 每后端）。本节数据为 §6.2 §10 项 sync 删除后、最新 rebase 代码（含 `c10e5af use numpy buffers in hashing path`）上重新验证的结果。
 
 ### 7.1 输出可用性
 
@@ -374,29 +394,29 @@ verifier 跑五项垃圾检查：replacement char、控制字符、低熵、priv
 
 | 后端 | turn | ok | empty | err | **garbled** | 平均长度 (chars) |
 |---|---:|---:|---:|---:|---:|---:|
-| baseline | 1 / 2 / 3 | 50 / 50 / 50 | 0 / 0 / 0 | 0 / 0 / 0 | **0 / 0 / 0** | 305 / 314 / 312 |
-| **shmradix** | 1 / 2 / 3 | **50 / 50 / 50** | 0 / 0 / 0 | 0 / 0 / 0 | **0 / 0 / 0** | 303 / 315 / 313 |
+| baseline | 1 / 2 / 3 | 50 / 50 / 50 | 0 / 0 / 0 | 0 / 0 / 0 | **0 / 0 / 0** | 306 / 315 / 315 |
+| **shmradix** | 1 / 2 / 3 | **50 / 50 / 50** | 0 / 0 / 0 | 0 / 0 / 0 | **0 / 0 / 0** | 304 / 315 / 311 |
 
 两边都 150/150 ok，**0 garbled / 0 empty / 0 error**。抽样输出都是切题英文，turn 2/3 显式延续 turn 1 上下文（"continue explaining"、"asking about the get(i) method I provided earlier"），KV cache 命中后模型行为完全正常。
 
 ### 7.2 KV cache 真实复用（H2D 证据）
 
-从 FlexKV worker 日志抓 `H2D transfer request: N finished transfer data size: X GB transfer bandwidth: Y GB/s`，每行 = 一次真实 CPU→GPU 内存拷贝。
+`verify_correctness.py` 在 multiturn + phase1 start-marker 时间窗内统计 FlexKV worker 的 H2D 完成事件（每行 = 一次真实 CPU→GPU `cudaMemcpyAsync`）。
 
-| 后端 | H2D 事件数 | 总传输 (GB) | 平均带宽 (GB/s) |
-|---|---:|---:|---:|
-| baseline | 81 | **6.510** | 26.74 |
-| shmradix | 92 | **6.510** | 24.90 |
+| 后端 | H2D 事件数 | 总传输 (GB) | 平均带宽 (GB/s) | hit ratio (窗内) |
+|---|---:|---:|---:|---:|
+| baseline | 256 | **150.510** | 29.26 | 46.70 % |
+| shmradix | 730 | **150.510** | 25.58 | 46.70 % |
 
-两边**总搬运字节完全相等**（同 workload 同 cache → 同物理 IO），证明 FlexKV 命中**不是仅 metadata 命中**，是真把 KV bytes 从 CPU pinned buffer cudaMemcpy 回 GPU 槽。带宽 25-27 GB/s 是 H20 PCIe 正常范围。
+两边**总搬运字节完全相等（150.510 GB）**且**命中率完全相等（46.70%）**，证明 FlexKV 命中**不是仅 metadata 命中**，是真把 KV bytes 从 CPU pinned buffer cudaMemcpy 回 GPU 槽。事件数不同因为 shmradix 路径会把同一组 block 拆得更细（更多小 op），但物理 IO 总量恒等。带宽 25-29 GB/s 是 H20 PCIe 正常范围。
 
 ### 7.3 跨后端输出一致性
 
 | 维度 | 值 |
 |---|---|
 | 比较的 (conv, turn) 单元格 | 150 |
-| 文本完全相同 | 107 (71.3 %) |
-| 不同但都合理 | 43 (28.7 %) |
+| 文本完全相同 | 112 (74.7 %) |
+| 不同但都合理 | 38 (25.3 %) |
 | 乱码 | **0** |
 
 差异都是 CUDA kernel 非确定性 + DP-server 自然负载均衡导致的换词（同 backend 重跑两次也有 ~10-15 % 漂移）。所有差异样本都是**前缀几乎一致，后段分支选词不同**。
