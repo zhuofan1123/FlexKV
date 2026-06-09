@@ -29,7 +29,7 @@ FlexKV 原本的 multi-DP 路径走 `server_client_mode=True`：N 个推理引�
 
 ### 1.2 radixshmem 做了什么
 
-[radixshmem](../../../radixshmem-zf/radixshmem)（同事写的库）把一棵 **radix tree** 整体放在 POSIX 共享内存里（`shm_open` + `mmap`），用 process-shared `pthread_rwlock` 协调，自带 buddy allocator + slot mempool。多个进程 attach 到同一段 shm 之后，可以**并行**做 prefix match / insert，**不需要任何中心进程**。
+[radixshmem](https://gitlab-master.nvidia.com/zhuofanl/radixshmem/-/tree/dev?ref_type=heads)（同事写的库，`dev` 分支）把一棵 **radix tree** 整体放在 POSIX 共享内存里（`shm_open` + `mmap`），用 process-shared `pthread_rwlock` 协调，自带 buddy allocator + slot mempool。多个进程 attach 到同一段 shm 之后，可以**并行**做 prefix match / insert，**不需要任何中心进程**。
 
 FlexKV 端做了三件事：
 
@@ -92,21 +92,23 @@ DP scheduler 进程 0   ...   DP scheduler 进程 N-1
 
 ### 3.1 radixshmem 库
 
-源码：[`radixshmem-zf/radixshmem`](../../../radixshmem-zf/radixshmem)（同事的仓库）。
+源码（独立仓库，同事维护）：<https://gitlab-master.nvidia.com/zhuofanl/radixshmem/-/tree/dev?ref_type=heads>，本文档对应 `dev` 分支。
 
-预编译产物（容器测试场景）：
-- `radixshmem/python/shmradix/_core.cpython-312-x86_64-linux-gnu.so`（Python 3.12，已 ship 在 bind-mount 路径下，不需要重新编译）
-
-如果需要从源码编译：
+从源码编译：
 
 ```bash
-cd radixshmem-zf/radixshmem
-# 系统依赖：libxxhash-dev、liburing-dev（或用 mooncake_transfer_engine.libs 里的版本）
+git clone -b dev ssh://git@gitlab-master.nvidia.com:12051/zhuofanl/radixshmem.git
+cd radixshmem
+# 系统依赖：libxxhash-dev、liburing-dev、cmake、pybind11
+#   - libxxhash-dev / liburing-dev 没有就从 host 拷 header，或用 mooncake_transfer_engine.libs 里 ship 的 liburing.so.2
+#   - cmake、pybind11 可以 pip install
 # 主仓库构建
 mkdir build && cd build && cmake .. && make -j
-# Python binding
-cd ../python && pip install -e .
+# Python binding（产物：python/shmradix/_core.cpython-3xx-x86_64-linux-gnu.so）
+cd ../python && pip install -e . --no-build-isolation
 ```
+
+容器场景下需要把构建产物 `python/shmradix/_core.cpython-<py>-x86_64-linux-gnu.so` 放到 `PYTHONPATH=/work/radixshmem/python` 能看到的位置（bind-mount 整个仓库即可）。Python 3.12 + torch 2.10 + glibc 2.35 已验证。
 
 ### 3.2 FlexKV
 
@@ -122,6 +124,9 @@ pip install -e . --no-build-isolation
 vllm 官方镜像 `vllm/vllm-openai:vX.X.X` 不含 FlexKV 和它的 native 依赖。常用做法是 bind-mount 源码进容器，并跑一次性 setup 脚本：
 
 ```bash
+# 先把 radixshmem (dev 分支) clone 到 /path/to/radixshmem
+git clone -b dev ssh://git@gitlab-master.nvidia.com:12051/zhuofanl/radixshmem.git /path/to/radixshmem
+
 # 创建容器（注意 --shm-size，见 §4.4 / §6.1 容量算法）
 docker run -d --name dp-shm-test \
     --network host --shm-size=400g --gpus all \
@@ -479,5 +484,5 @@ verifier 跑五项垃圾检查：replacement char、控制字符、低熵、priv
 ## 联系
 
 - 主仓库：[`FlexKV`](https://github.com/taco-project/FlexKV)
-- radixshmem 依赖：（参见各项目内部联系方式）
+- radixshmem 依赖：<https://gitlab-master.nvidia.com/zhuofanl/radixshmem/-/tree/dev?ref_type=heads>（`dev` 分支）
 - 完整调试历史：本仓库 git log + 本目录下其它 dp_shmradix_*.md 文档
