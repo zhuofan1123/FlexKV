@@ -47,7 +47,7 @@ import numpy as np
 
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.transfer import TransferOp, TransferOpGraph
+from flexkv.common.transfer import DeviceType, TransferOp, TransferOpGraph, TransferType
 from flexkv.cache.cache_engine import GlobalCacheEngine, DEFAULT_CACHE_STRATEGY
 from flexkv.transfer.shm_channel_handle import TransferManagerShmChannelHandle
 
@@ -80,26 +80,104 @@ class PrefetchController:
                  cache_config: CacheConfig,
                  external_index: int = 0,
                  server_id: Optional[str] = None):
-        if not bool(getattr(GLOBAL_CONFIG_FROM_ENV, "radix_shmem", False)):
-            raise RuntimeError(
-                "PrefetchController requires radix_shmem mode; set "
-                "FLEXKV_RADIX_SHMEM=1 (and GLOBAL_CONFIG_FROM_ENV.radix_shmem) "
-                "and a matching shm_radix_server_id before constructing it."
-            )
+        """Config-based entry: builds a full GlobalCacheEngine to generate
+        graphs. Requires model_config/cache_config that match the running
+        FlexKV. For a lighter, config-free path see `PrefetchController.attach`.
+        """
         if not cache_config.enable_cpu:
             raise ValueError("PrefetchController requires enable_cpu=True")
 
         self.model_config = model_config
         self.cache_config = cache_config
-        self.external_index = external_index
+        self.num_layers = model_config.num_layers
+        self.tokens_per_block = cache_config.tokens_per_block
 
-        self.instance_num = GLOBAL_CONFIG_FROM_ENV.instance_num
+        self._init_common(external_index, server_id, dp_size=model_config.dp_size)
+
+        # Config path: GlobalCacheEngine attaches radix RadixClient(s) and owns
+        # the graph-generation logic. `prefetch()` uses cache_engine.get().
+        self.cache_engine = GlobalCacheEngine(cache_config, model_config)
+        self.cpu_engine = self.cache_engine.cpu_cache_engine
+        self.ssd_engine = self.cache_engine.ssd_cache_engine
+        self._manual_graph = False
+
+        # CE-side shm channel to the shared TE (created by the FlexKV bootstrap).
+        # The handle ignores model/cache config; it attaches purely by
+        # (server_id, channel_id).
+        self.handle = TransferManagerShmChannelHandle(
+            model_config, cache_config, self.server_id, self.channel_id)
+
+    @classmethod
+    def attach(cls,
+               *,
+               server_id: str,
+               tokens_per_block: int,
+               num_layers: int,
+               external_index: int = 0,
+               enable_ssd: bool = True,
+               enable_remote: bool = False,
+               instance_num: int = 1,
+               dp_size: int = 1) -> "PrefetchController":
+        """Config-free entry for pure SSD/Remote -> CPU prefetch.
+
+        Attaches directly to the shared CPU (+ SSD) radix regions as RadixClients
+        and hand-builds the DISK2H graph, bypassing GlobalCacheEngine and any
+        FlexKVConfig / model-geometry / block-count math. The only values that
+        matter are:
+          - server_id          : names the shm radix regions + TE channels
+          - tokens_per_block    : block-hash boundary; MUST equal vLLM block_size
+          - num_layers          : transfer op layer_granularity
+          - enable_ssd/remote   : which source tiers exist
+          - instance_num/dp_size: to place channel_id beyond internal DP clients
+        Block counts / byte layout are irrelevant here (capacity comes from the
+        shm region; byte offsets are computed by the TE from its own layout).
+        """
+        from flexkv.cache.radix_shmem_engine import CacheEngineRadixShmem
+        from flexkv.server.shm_radix_bootstrap import shm_name_for
+
+        self = cls.__new__(cls)
+        self.model_config = None
+        self.cache_config = None
+        self.num_layers = num_layers
+        self.tokens_per_block = tokens_per_block
+
+        self._init_common(external_index, server_id, dp_size=dp_size,
+                           instance_num=instance_num)
+
+        # Attach one RadixClient per source tier directly. num_total_blocks is
+        # cosmetic (capacity is defined by the already-created shm region).
+        self.cache_engine = None
+        self.cpu_engine = CacheEngineRadixShmem(
+            device_type=DeviceType.CPU, num_total_blocks=0,
+            tokens_per_block=tokens_per_block,
+            shm_name=shm_name_for(DeviceType.CPU, self.server_id))
+        self.ssd_engine = None
+        if enable_ssd:
+            self.ssd_engine = CacheEngineRadixShmem(
+                device_type=DeviceType.SSD, num_total_blocks=0,
+                tokens_per_block=tokens_per_block,
+                shm_name=shm_name_for(DeviceType.SSD, self.server_id))
+        self._manual_graph = True
+
+        self.handle = TransferManagerShmChannelHandle(
+            None, None, self.server_id, self.channel_id)
+        return self
+
+    def _init_common(self,
+                     external_index: int,
+                     server_id: Optional[str],
+                     dp_size: int,
+                     instance_num: Optional[int] = None) -> None:
+        """Shared setup: server_id, disjoint id ranges, reserved channel, state."""
+        self.external_index = external_index
+        self.instance_num = (instance_num if instance_num is not None
+                             else GLOBAL_CONFIG_FROM_ENV.instance_num)
         self.server_id = server_id or getattr(
             GLOBAL_CONFIG_FROM_ENV, "shm_radix_server_id", "default")
 
         # Internal DP clients occupy client ids / channel ids [0, total_clients).
         # We live strictly beyond that band.
-        total_clients = self.instance_num * self.model_config.dp_size
+        total_clients = self.instance_num * dp_size
         self.total_clients = total_clients
         self.external_client_id = total_clients + external_index
         self.channel_id = total_clients + external_index
@@ -123,14 +201,6 @@ class PrefetchController:
             self.external_client_id << 32,
             (self.external_client_id + 1) << 32,
         )
-
-        # GlobalCacheEngine in radix_shmem mode attaches to the shared radix
-        # regions as RadixClient(s) — one per enabled device type.
-        self.cache_engine = GlobalCacheEngine(cache_config, model_config)
-
-        # CE-side shm channel to the shared TE (created by the FlexKV bootstrap).
-        self.handle = TransferManagerShmChannelHandle(
-            model_config, cache_config, self.server_id, self.channel_id)
 
         self._task_id_counter = 0
         self._task_id_lock = threading.Lock()
@@ -209,24 +279,12 @@ class PrefetchController:
 
         task_id = self._gen_task_id()
 
-        # CPU-only upload, mirroring KVTaskManager.create_prefetch_task.
-        temp = copy.deepcopy(DEFAULT_CACHE_STRATEGY)
-        temp.ignore_gpu = True   # do not touch GPU
-        temp.ignore_gds = True   # no GDS path
-
-        fake_slot_mapping = np.zeros_like(token_ids)
-        fake_token_mask = np.ones_like(token_ids)
-
-        graph, _return_mask, callback, _op_callback_dict, task_end_op_id = \
-            self.cache_engine.get(
-                request_id=task_id,
-                token_ids=token_ids,
-                token_mask=fake_token_mask,
-                slot_mapping=fake_slot_mapping,
-                layer_num=self.model_config.num_layers,
-                temp_cache_strategy=temp,
-                namespace=namespace,
-            )
+        if self._manual_graph:
+            graph, callback, task_end_op_id = self._build_prefetch_graph(
+                task_id, token_ids, namespace)
+        else:
+            graph, callback, task_end_op_id = self._get_prefetch_graph_via_ce(
+                task_id, token_ids, namespace)
 
         num_ops = graph.num_ops
         state = _PrefetchState(task_id, callback, task_end_op_id, num_ops)
@@ -234,8 +292,12 @@ class PrefetchController:
         self._pending[graph.graph_id] = state
 
         if num_ops == 0:
-            # Nothing to move (already ready in CPU, or nothing matched). Run the
-            # write-path callback (set_ready + dec_ref) and mark done.
+            # Nothing to move. This covers every "don't bother the TM" case:
+            #   - SSD had no hit (or SSD disabled)         -> n <= 0
+            #   - SSD hit is fully contained in CPU already -> n <= 0
+            #   - CPU pool couldn't allocate room           -> aborted
+            # We do NOT submit an empty graph to the TE; just run the (possibly
+            # None) callback and mark done so wait() returns immediately.
             self.noop_count += 1
             self._finish(graph.graph_id)
         else:
@@ -243,6 +305,128 @@ class PrefetchController:
             self.handle.submit(graph)
 
         return task_id
+
+    def _get_prefetch_graph_via_ce(self, task_id, token_ids, namespace):
+        """Config path: delegate to GlobalCacheEngine.get() (CPU-only upload)."""
+        temp = copy.deepcopy(DEFAULT_CACHE_STRATEGY)
+        temp.ignore_gpu = True   # do not touch GPU
+        temp.ignore_gds = True   # no GDS path
+        fake_slot_mapping = np.zeros_like(token_ids)
+        fake_token_mask = np.ones_like(token_ids)
+        graph, _return_mask, callback, _op_callback_dict, task_end_op_id = \
+            self.cache_engine.get(
+                request_id=task_id,
+                token_ids=token_ids,
+                token_mask=fake_token_mask,
+                slot_mapping=fake_slot_mapping,
+                layer_num=self.num_layers,
+                temp_cache_strategy=temp,
+                namespace=namespace,
+            )
+        return graph, callback, task_end_op_id
+
+    def _build_prefetch_graph(self, task_id, token_ids, namespace):
+        """Config-free path: hand-build the SSD->CPU (DISK2H) graph.
+
+        Mirrors the collapsed `_get_impl_local` slice for
+        ignore_gpu+ignore_gds+no-p2p: a single DISK2H op moving the blocks that
+        are ready in SSD but not yet in CPU. Returns (graph, callback,
+        task_end_op_id). callback fires the insert finalize (set_ready+dec_ref),
+        releases the CPU node lock and the match pre-locks, and recycles unused
+        slots — it MUST run on completion (via poll/wait) or refs leak and the
+        shared mempool starves.
+        """
+        from flexkv.common.block import SequenceMeta
+
+        seq = SequenceMeta(token_ids=token_ids,
+                           tokens_per_block=self.tokens_per_block,
+                           namespace=namespace)
+
+        empty_graph = TransferOpGraph.create_empty_graph()
+
+        cpu_m = self.cpu_engine.match(seq)
+        ssd_m = self.ssd_engine.match(seq) if self.ssd_engine is not None else None
+
+        cpu_ready = cpu_m.num_ready_matched_blocks
+        ssd_ready = ssd_m.num_ready_matched_blocks if ssd_m is not None else 0
+
+        # Blocks ready in SSD but not yet in CPU: the set we can warm.
+        n = ssd_ready - cpu_ready
+
+        def release_prelocks():
+            # match(lock=True) atomically inc_ref'd the ready prefix; release
+            # symmetrically on every path so we never leak a match ref.
+            pre = getattr(cpu_m, "pre_locked_node", None)
+            if pre is not None:
+                self.cpu_engine.unlock(pre)
+                cpu_m.pre_locked_node = None
+            if ssd_m is not None:
+                pre_s = getattr(ssd_m, "pre_locked_node", None)
+                if pre_s is not None:
+                    self.ssd_engine.unlock(pre_s)
+                    ssd_m.pre_locked_node = None
+
+        if n <= 0:
+            # Nothing to warm (already in CPU, or SSD doesn't have more). Still
+            # must drop the match pre-locks.
+            release_prelocks()
+            return empty_graph, None, -1
+
+        ssd_slots = np.asarray(ssd_m.physical_blocks[:ssd_ready], dtype=np.int64)
+        # The tail `n` blocks are the ones missing from CPU (CPU has the first
+        # cpu_ready of the shared prefix).
+        src_ssd = ssd_slots[cpu_ready:cpu_ready + n]
+
+        cpu_slots = self.cpu_engine.take(
+            num_required_blocks=n,
+            protected_node=cpu_m.last_node,
+            strict=False,
+        )
+        if len(cpu_slots) < n:
+            # Not enough CPU space even after LRU eviction — skip (do not crash).
+            self.cpu_engine.recycle(cpu_slots)
+            release_prelocks()
+            return empty_graph, None, -1
+
+        graph = TransferOpGraph()
+        op = TransferOp(
+            graph_id=graph.graph_id,
+            transfer_type=TransferType.DISK2H,
+            src_block_ids=np.asarray(src_ssd, dtype=np.int64),
+            dst_block_ids=np.asarray(cpu_slots, dtype=np.int64),
+            layer_id=0,
+            layer_granularity=self.num_layers,
+        )
+        graph.add_transfer_op(op)
+
+        # Insert the freshly-allocated CPU slots as an UNREADY suffix so a
+        # concurrent reader won't treat them as valid before the transfer lands.
+        # insert() auto-inc_refs (locks) the node and arms a finalize
+        # (set_ready + dec_ref). We additionally lock_node for the hand-off,
+        # mirroring _get_impl_local.
+        cpu_node, cpu_unused = self.cpu_engine.insert(
+            seq, np.asarray(cpu_slots, dtype=np.int64),
+            num_insert_blocks=ssd_ready, is_ready=False, match_result=cpu_m)
+        if cpu_node is not None:
+            self.cpu_engine.lock_node(cpu_node)
+
+        # Take over protection, then drop the match pre-locks (as _get_impl_local
+        # does): lock_node above already took an independent ref for matched
+        # nodes; inserted nodes carry their own armed finalize.
+        release_prelocks()
+
+        node_size = cpu_node.size() if cpu_node is not None else 0
+
+        def callback():
+            # set_ready THEN unlock — for inserted nodes shmradix fuses both into
+            # the armed finalize fired by unlock(); set_ready is then a no-op.
+            if cpu_node is not None:
+                self.cpu_engine.set_ready(cpu_node, True, node_size)
+                self.cpu_engine.unlock(cpu_node)
+            if cpu_unused is not None and getattr(cpu_unused, "size", 0) > 0:
+                self.cpu_engine.recycle(cpu_unused)
+
+        return graph, callback, op.op_id
 
     # ---- completion draining ----
 

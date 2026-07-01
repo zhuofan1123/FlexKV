@@ -205,7 +205,7 @@ def _external_prefetch_proc(server_id, dp_size, ssd_dir, ready_evt, wrote_evt,
     _set_radix_env(server_id)
     from flexkv.prefetch import PrefetchController
 
-    model_config, cache_config = _make_configs(dp_size, ssd_dir)
+    model_config, _cache_config = _make_configs(dp_size, ssd_dir)
     tag = "[external]"
     pc = None
     try:
@@ -215,7 +215,15 @@ def _external_prefetch_proc(server_id, dp_size, ssd_dir, ready_evt, wrote_evt,
         # small settle so the TE ctrl ready flag is observable
         time.sleep(0.5)
 
-        pc = PrefetchController(model_config, cache_config, external_index=0)
+        # Config-free attach: only server_id + tokens_per_block + num_layers.
+        pc = PrefetchController.attach(
+            server_id=server_id,
+            tokens_per_block=TOKENS_PER_BLOCK,
+            num_layers=model_config.num_layers,
+            enable_ssd=True,
+            external_index=0,
+            dp_size=dp_size,
+        )
         pc.start(ready_timeout_s=60)
         print(f"{tag} controller READY channel_id={pc.channel_id}", flush=True)
 
