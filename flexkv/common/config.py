@@ -751,6 +751,11 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Identifier used to name radix shm regions and TE shm channels. Lets
     # multiple FlexKV instances coexist on a host.
     shm_radix_server_id=os.getenv('FLEXKV_SHM_RADIX_ID', 'default'),
+    # Extra shm TE channels reserved beyond the internal DP clients
+    # (total_clients = instance_num * dp_size). External processes (e.g. a
+    # prefetch controller attaching to the shared radix index) submit graphs to
+    # the single TE via channel_ids in [total_clients, total_clients + extra).
+    num_extra_te_channels=int(os.getenv('FLEXKV_NUM_EXTRA_TE_CHANNELS', 1)),
 
     index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
     cpu_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_CPU_LAYOUT', 'BLOCKFIRST').upper()),

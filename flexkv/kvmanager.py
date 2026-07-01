@@ -182,11 +182,15 @@ class KVManager:
                 self.model_config, self.cache_config,
                 server_id=server_id,
             )
+            # Reserve extra channels beyond the internal DP clients so external
+            # processes (e.g. a prefetch controller) can attach to the shared TE
+            # using channel_ids in [total_clients, total_clients + num_extra).
+            num_extra = getattr(GLOBAL_CONFIG_FROM_ENV, "num_extra_te_channels", 0)
             self._shm_te_process = TransferManagerShmTEProcess(
                 self.model_config, self.cache_config,
                 gpu_register_port=self.gpu_register_port,
                 server_id=server_id,
-                num_channels=total_clients,
+                num_channels=total_clients + num_extra,
             )
             self._shm_te_process.start()
         else:
