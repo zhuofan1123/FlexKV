@@ -83,8 +83,13 @@ class PrefetchController:
                                 num_layers=64)
         pc.start()                         # wait until TE ready
         tid = pc.prefetch(token_ids)       # returns task id
-        pc.wait([tid], timeout=5.0)        # block until warmed into CPU
+        while not pc.is_done(tid):         # drive completions yourself
+            pc.poll(timeout=0.005)
         pc.shutdown()
+
+    poll() is the only drain primitive and MUST be called (in a loop, or
+    periodically) — a task's finalize (set_ready + dec_ref) fires from it, so
+    skipping it leaks refs and starves the shared mempool.
     """
 
     def __init__(self,
@@ -356,9 +361,15 @@ class PrefetchController:
     # ---- completion draining ----
 
     def _finish(self, graph_id: int) -> None:
-        state = self._pending.get(graph_id)
-        if state is None or state.done:
+        """Run the graph's finalize callback (once) and reap its tracking state.
+
+        Reaping here (rather than in a separate wait()) keeps `_pending` /
+        `_task_to_graph` bounded for a long-running driver.
+        """
+        state = self._pending.pop(graph_id, None)
+        if state is None:
             return
+        self._task_to_graph.pop(state.task_id, None)
         if state.callback is not None:
             try:
                 state.callback()
@@ -367,62 +378,20 @@ class PrefetchController:
                     f"PrefetchController callback failed for graph {graph_id}: {e}",
                     exc_info=True,
                 )
-        state.done = True
 
     def poll(self, timeout: float = 0.0) -> None:
-        """Drain completed ops from our channel and finalize done graphs."""
+        """Drain completed ops from our channel and finalize done graphs.
+
+        This is the ONLY drain primitive — a prefetch task's finalize
+        (set_ready + dec_ref) fires from here, so the caller MUST call poll()
+        (in a loop, or after issuing prefetches) or refs leak and the shared
+        mempool starves. Combine with `is_done(task_id)` to build a wait loop.
+        """
         for cop in self.handle.wait(timeout):
-            state = self._pending.get(cop.graph_id)
-            if state is None:
-                # Defensive: our graph_id range is disjoint, so this shouldn't
-                # happen unless a stale completion arrives after wait() dropped
-                # the task. Ignore.
-                continue
             if cop.is_graph_completed():  # op_id == -1: whole graph done
                 self._finish(cop.graph_id)
 
     def is_done(self, task_id: int) -> bool:
-        graph_id = self._task_to_graph.get(task_id)
-        if graph_id is None:
-            return True  # unknown / already reaped
-        state = self._pending.get(graph_id)
-        return state is None or state.done
-
-    def wait(self,
-             task_ids,
-             timeout: float = 20.0) -> Dict[int, bool]:
-        """Block until the given prefetch tasks complete (or timeout).
-
-        Returns {task_id: success_bool}. A task with no graph ops returns True
-        immediately. After a task completes it is reaped from internal maps.
-        """
-        import time
-        if isinstance(task_ids, int):
-            task_ids = [task_ids]
-        results: Dict[int, bool] = {}
-        start = time.time()
-
-        self.poll(timeout=0.0)
-        remaining = list(task_ids)
-        while remaining:
-            still: List[int] = []
-            for tid in remaining:
-                if self.is_done(tid):
-                    results[tid] = True
-                    self._reap(tid)
-                else:
-                    still.append(tid)
-            remaining = still
-            if not remaining:
-                break
-            if time.time() - start > timeout:
-                for tid in remaining:
-                    results[tid] = False
-                break
-            self.poll(timeout=0.001)
-        return results
-
-    def _reap(self, task_id: int) -> None:
-        graph_id = self._task_to_graph.pop(task_id, None)
-        if graph_id is not None:
-            self._pending.pop(graph_id, None)
+        """True once the task's graph completed (and was reaped) — or if it was
+        a no-op / unknown id. Call poll() first to drain fresh completions."""
+        return task_id not in self._task_to_graph

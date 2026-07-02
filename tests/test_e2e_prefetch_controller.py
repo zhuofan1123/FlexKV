@@ -243,11 +243,13 @@ def _external_prefetch_proc(server_id, dp_size, ssd_dir, ready_evt, wrote_evt,
             rng_seed=SHARED_SEED, start_block=0, n_blocks=BLOCK_PER_REQUEST)
 
         # Single prefetch of the evicted prefix. Because it is not ready in CPU,
-        # cache_engine.get() produces a non-empty SSD->CPU graph, which is
-        # submitted to the TE over our reserved channel and routed back to us.
+        # it produces a non-empty SSD->CPU graph, submitted to the TE over our
+        # reserved channel and routed back to us. Drive completion via poll().
         tid = pc.prefetch(token_ids=tok)
-        res = pc.wait([tid], timeout=30)
-        all_ok = res.get(tid, False)
+        deadline = time.monotonic() + 30
+        while not pc.is_done(tid) and time.monotonic() < deadline:
+            pc.poll(timeout=0.005)
+        all_ok = pc.is_done(tid)
         submitted = pc.submitted_count
         # graph_id our task used must be in our disjoint band (record before reap).
         print(f"{tag} prefetch result={res} all_ok={all_ok} "
