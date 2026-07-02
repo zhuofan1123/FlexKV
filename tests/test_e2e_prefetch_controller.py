@@ -248,7 +248,7 @@ def _external_prefetch_proc(server_id, dp_size, ssd_dir, ready_evt, wrote_evt,
         tid = pc.prefetch(token_ids=tok)
         deadline = time.monotonic() + 30
         while not pc.is_done(tid) and time.monotonic() < deadline:
-            pc.poll(timeout=0.005)
+            time.sleep(0.002)   # background thread drains; just watch is_done
         all_ok = pc.is_done(tid)
         submitted = pc.submitted_count
         # graph_id our task used must be in our disjoint band (record before reap).

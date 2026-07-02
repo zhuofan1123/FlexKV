@@ -82,15 +82,15 @@ class PrefetchController:
     Usage:
         pc = PrefetchController(server_id="node0", tokens_per_block=16,
                                 num_layers=64)
-        pc.start()                         # wait until TE ready
-        tid = pc.prefetch(token_ids)       # returns task id
-        while not pc.is_done(tid):         # drive completions yourself
-            pc.poll(timeout=0.005)
-        pc.shutdown()
+        pc.start()                         # ready + starts background drain
+        tid = pc.prefetch(token_ids)       # fire-and-forget from any thread
+        ...                                # optionally check pc.is_done(tid)
+        pc.shutdown()                      # stops the drain thread
 
-    poll() is the only drain primitive and MUST be called (in a loop, or
-    periodically) — a task's finalize (set_ready + dec_ref) fires from it, so
-    skipping it leaks refs and starves the shared mempool.
+    start() launches a daemon thread that drains completions every ~1 ms and
+    fires each task's finalize (set_ready + dec_ref). The caller's thread only
+    calls prefetch(); it never polls. Thread-safe: prefetch() may be called
+    concurrently with the drain thread.
     """
 
     def __init__(self,
@@ -145,6 +145,16 @@ class PrefetchController:
         self._task_to_graph: Dict[int, int] = {}       # task_id -> graph_id
         self._started = False
 
+        # Concurrency: a background thread drains completions (poll) while the
+        # caller's thread issues prefetch(). _state_lock guards the bookkeeping
+        # dicts + inflight gauges; _poll_lock keeps the result ring single-
+        # consumer (poll must not run from two threads at once).
+        self._state_lock = threading.Lock()
+        self._poll_lock = threading.Lock()
+        self._poll_thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._poll_interval_s = 0.001  # 1 ms idle futex wait between drains
+
         # Cumulative instrumentation: how many prefetch tasks submitted a
         # non-empty graph to the TE (vs. the empty-graph fast path where the
         # prefix was already ready in CPU).
@@ -184,6 +194,13 @@ class PrefetchController:
         while time.monotonic() < deadline:
             if self.handle.is_ready():
                 self._started = True
+                # Launch the background drain thread. From here the caller only
+                # calls prefetch(); completions (and their finalize) are drained
+                # automatically every ~1 ms — the caller's thread never polls.
+                self._stop.clear()
+                self._poll_thread = threading.Thread(
+                    target=self._poll_loop, name="prefetch-poll", daemon=True)
+                self._poll_thread.start()
                 flexkv_logger.info(
                     f"PrefetchController ready: server_id={self.server_id} "
                     f"channel_id={self.channel_id} "
@@ -197,10 +214,27 @@ class PrefetchController:
             f"(server_id={self.server_id}, channel_id={self.channel_id})"
         )
 
+    def _poll_loop(self) -> None:
+        # Blocks up to _poll_interval_s in a futex inside handle.wait() when the
+        # ring is empty, so this thread costs ~nothing while idle.
+        while not self._stop.is_set():
+            try:
+                self.poll(timeout=self._poll_interval_s)
+            except Exception as e:  # pragma: no cover
+                flexkv_logger.error(f"prefetch poll loop error: {e}",
+                                    exc_info=True)
+
     def is_ready(self) -> bool:
         return self.handle.is_ready()
 
     def shutdown(self) -> None:
+        # Stop the drain thread first so nothing touches the channel/engines
+        # after we close them.
+        self._stop.set()
+        th = self._poll_thread
+        if th is not None and th.is_alive():
+            th.join(timeout=2.0)
+        self._poll_thread = None
         # Close only our channel. The TE keeps running for internal FlexKV, and
         # the radix regions are owned by the FlexKV bootstrap process — we must
         # NOT unlink shm or tear them down here.
@@ -240,29 +274,36 @@ class PrefetchController:
 
         task_id = self._gen_task_id()
 
-        graph, callback, task_end_op_id, num_blocks = self._build_prefetch_graph(
-            task_id, token_ids, namespace)
+        # Hold _state_lock across the whole build: it serializes shmradix engine
+        # access (match/take/insert here vs. the poll thread's finalize
+        # unlock/recycle — pybind releases the GIL, so without this two threads
+        # would enter the same RadixClient in parallel). It also makes
+        # "register pending" happen-before "submit", so a completion can never
+        # arrive at the poll thread before _pending knows the graph.
+        with self._state_lock:
+            graph, callback, task_end_op_id, num_blocks = \
+                self._build_prefetch_graph(task_id, token_ids, namespace)
 
-        num_ops = graph.num_ops
-        state = _PrefetchState(task_id, callback, task_end_op_id, num_ops,
-                               num_blocks)
-        self._task_to_graph[task_id] = graph.graph_id
-        self._pending[graph.graph_id] = state
+            num_ops = graph.num_ops
+            state = _PrefetchState(task_id, callback, task_end_op_id, num_ops,
+                                   num_blocks)
+            self._task_to_graph[task_id] = graph.graph_id
+            self._pending[graph.graph_id] = state
 
-        if num_ops == 0:
-            # Nothing to move. This covers every "don't bother the TM" case:
-            #   - SSD had no hit (or SSD disabled)         -> n <= 0
-            #   - SSD hit is fully contained in CPU already -> n <= 0
-            #   - CPU pool couldn't allocate room           -> aborted
-            # We do NOT submit an empty graph to the TE; just run the (possibly
-            # None) callback and reap so is_done() is immediately True.
-            self.noop_count += 1
-            self._finish(graph.graph_id)
-        else:
-            self.submitted_count += 1
-            self.inflight_requests += 1
-            self.inflight_blocks += num_blocks
-            self.handle.submit(graph)
+            if num_ops == 0:
+                # Nothing to move. Covers every "don't bother the TM" case:
+                #   - SSD had no hit (or SSD disabled)          -> n <= 0
+                #   - SSD hit is fully contained in CPU already -> n <= 0
+                #   - CPU pool couldn't allocate room           -> aborted
+                # We do NOT submit an empty graph; run the (possibly None)
+                # callback and reap so is_done() is immediately True.
+                self.noop_count += 1
+                self._finish_locked(graph.graph_id)
+            else:
+                self.submitted_count += 1
+                self.inflight_requests += 1
+                self.inflight_blocks += num_blocks
+                self.handle.submit(graph)
 
         return task_id
 
@@ -370,11 +411,12 @@ class PrefetchController:
 
     # ---- completion draining ----
 
-    def _finish(self, graph_id: int) -> None:
+    def _finish_locked(self, graph_id: int) -> None:
         """Run the graph's finalize callback (once) and reap its tracking state.
 
-        Reaping here (rather than in a separate wait()) keeps `_pending` /
-        `_task_to_graph` bounded for a long-running driver.
+        Caller MUST hold `_state_lock` (serializes shmradix engine access and
+        the bookkeeping dicts). Reaping here keeps `_pending` / `_task_to_graph`
+        bounded for a long-running driver.
         """
         state = self._pending.pop(graph_id, None)
         if state is None:
@@ -396,16 +438,22 @@ class PrefetchController:
     def poll(self, timeout: float = 0.0) -> None:
         """Drain completed ops from our channel and finalize done graphs.
 
-        This is the ONLY drain primitive — a prefetch task's finalize
-        (set_ready + dec_ref) fires from here, so the caller MUST call poll()
-        (in a loop, or after issuing prefetches) or refs leak and the shared
-        mempool starves. Combine with `is_done(task_id)` to build a wait loop.
+        Normally driven by the internal background thread (~1 ms); callers do
+        not need to call this. Firing a task's finalize (set_ready + dec_ref)
+        happens here. `_poll_lock` keeps the result ring single-consumer; the
+        finalize itself runs under `_state_lock`.
         """
-        for cop in self.handle.wait(timeout):
-            if cop.is_graph_completed():  # op_id == -1: whole graph done
-                self._finish(cop.graph_id)
+        with self._poll_lock:
+            completed = [cop for cop in self.handle.wait(timeout)
+                         if cop.is_graph_completed()]  # op_id == -1
+        if not completed:
+            return
+        with self._state_lock:
+            for cop in completed:
+                self._finish_locked(cop.graph_id)
 
     def is_done(self, task_id: int) -> bool:
         """True once the task's graph completed (and was reaped) — or if it was
-        a no-op / unknown id. Call poll() first to drain fresh completions."""
-        return task_id not in self._task_to_graph
+        a no-op / unknown id."""
+        with self._state_lock:
+            return task_id not in self._task_to_graph
