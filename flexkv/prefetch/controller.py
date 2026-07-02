@@ -11,8 +11,8 @@ reserved shm channel.
 
 Why this is safe to run alongside internal FlexKV:
 
-  * **Shared index**: `GlobalCacheEngine` in radix_shmem mode attaches to the
-    radix regions as a `shmradix.RadixClient` (see
+  * **Shared index**: attaches to the CPU/SSD radix regions as
+    `shmradix.RadixClient`s (via
     `flexkv.cache.radix_shmem_engine.CacheEngineRadixShmem`). This process is
     just another client.
   * **Slot safety**: CPU/SSD slot allocation goes through shmradix's
@@ -39,16 +39,14 @@ never registers GPU blocks and never touches internal DP GPU memory.
 from __future__ import annotations
 
 import contextlib
-import copy
 import threading
 from typing import Dict, List, Optional
 
 import numpy as np
 
-from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.transfer import DeviceType, TransferOp, TransferOpGraph, TransferType
-from flexkv.cache.cache_engine import GlobalCacheEngine, DEFAULT_CACHE_STRATEGY
 from flexkv.transfer.shm_channel_handle import TransferManagerShmChannelHandle
 
 
@@ -64,116 +62,49 @@ class _PrefetchState:
 
 
 class PrefetchController:
-    """Prefetch driver that shares FlexKV's radix-shmem index and TE.
+    """External SSD/Remote -> CPU prefetch driver over FlexKV's radix-shmem.
+
+    Attaches directly to the shared CPU (+ SSD) radix regions as RadixClients and
+    hand-builds the DISK2H graph, submitting it to the shared TransferEngine over
+    a reserved shm channel. No FlexKVConfig / model-geometry / block-count math:
+    the only values that matter are
+
+      - server_id          : names the shm radix regions + TE channels
+      - tokens_per_block    : block-hash boundary; MUST equal vLLM block_size
+      - num_layers          : transfer op layer_granularity
+      - enable_ssd/remote   : which source tiers exist
+      - instance_num/dp_size: to place channel_id beyond internal DP clients
+
+    Block counts / byte layout are irrelevant (capacity comes from the shm
+    region; byte offsets are computed by the TE from its own registered layout).
 
     Usage:
-        pc = PrefetchController(model_config, cache_config)
-        pc.start()                         # attach + wait until TE ready
-        tid = pc.prefetch(token_ids)       # returns task id (or -1 if no-op)
-        ...                                # do other work
+        pc = PrefetchController(server_id="node0", tokens_per_block=16,
+                                num_layers=64)
+        pc.start()                         # wait until TE ready
+        tid = pc.prefetch(token_ids)       # returns task id
         pc.wait([tid], timeout=5.0)        # block until warmed into CPU
         pc.shutdown()
     """
 
     def __init__(self,
-                 model_config: ModelConfig,
-                 cache_config: CacheConfig,
+                 *,
+                 server_id: str,
+                 tokens_per_block: int,
+                 num_layers: int,
                  external_index: int = 0,
-                 server_id: Optional[str] = None):
-        """Config-based entry: builds a full GlobalCacheEngine to generate
-        graphs. Requires model_config/cache_config that match the running
-        FlexKV. For a lighter, config-free path see `PrefetchController.attach`.
-        """
-        if not cache_config.enable_cpu:
-            raise ValueError("PrefetchController requires enable_cpu=True")
-
-        self.model_config = model_config
-        self.cache_config = cache_config
-        self.num_layers = model_config.num_layers
-        self.tokens_per_block = cache_config.tokens_per_block
-
-        self._init_common(external_index, server_id, dp_size=model_config.dp_size)
-
-        # Config path: GlobalCacheEngine attaches radix RadixClient(s) and owns
-        # the graph-generation logic. `prefetch()` uses cache_engine.get().
-        self.cache_engine = GlobalCacheEngine(cache_config, model_config)
-        self.cpu_engine = self.cache_engine.cpu_cache_engine
-        self.ssd_engine = self.cache_engine.ssd_cache_engine
-        self._manual_graph = False
-
-        # CE-side shm channel to the shared TE (created by the FlexKV bootstrap).
-        # The handle ignores model/cache config; it attaches purely by
-        # (server_id, channel_id).
-        self.handle = TransferManagerShmChannelHandle(
-            model_config, cache_config, self.server_id, self.channel_id)
-
-    @classmethod
-    def attach(cls,
-               *,
-               server_id: str,
-               tokens_per_block: int,
-               num_layers: int,
-               external_index: int = 0,
-               enable_ssd: bool = True,
-               enable_remote: bool = False,
-               instance_num: int = 1,
-               dp_size: int = 1) -> "PrefetchController":
-        """Config-free entry for pure SSD/Remote -> CPU prefetch.
-
-        Attaches directly to the shared CPU (+ SSD) radix regions as RadixClients
-        and hand-builds the DISK2H graph, bypassing GlobalCacheEngine and any
-        FlexKVConfig / model-geometry / block-count math. The only values that
-        matter are:
-          - server_id          : names the shm radix regions + TE channels
-          - tokens_per_block    : block-hash boundary; MUST equal vLLM block_size
-          - num_layers          : transfer op layer_granularity
-          - enable_ssd/remote   : which source tiers exist
-          - instance_num/dp_size: to place channel_id beyond internal DP clients
-        Block counts / byte layout are irrelevant here (capacity comes from the
-        shm region; byte offsets are computed by the TE from its own layout).
-        """
+                 enable_ssd: bool = True,
+                 instance_num: int = 1,
+                 dp_size: int = 1):
         from flexkv.cache.radix_shmem_engine import CacheEngineRadixShmem
         from flexkv.server.shm_radix_bootstrap import shm_name_for
 
-        self = cls.__new__(cls)
-        self.model_config = None
-        self.cache_config = None
         self.num_layers = num_layers
         self.tokens_per_block = tokens_per_block
 
-        self._init_common(external_index, server_id, dp_size=dp_size,
-                           instance_num=instance_num)
-
-        # Attach one RadixClient per source tier directly. num_total_blocks is
-        # cosmetic (capacity is defined by the already-created shm region).
-        self.cache_engine = None
-        self.cpu_engine = CacheEngineRadixShmem(
-            device_type=DeviceType.CPU, num_total_blocks=0,
-            tokens_per_block=tokens_per_block,
-            shm_name=shm_name_for(DeviceType.CPU, self.server_id))
-        self.ssd_engine = None
-        if enable_ssd:
-            self.ssd_engine = CacheEngineRadixShmem(
-                device_type=DeviceType.SSD, num_total_blocks=0,
-                tokens_per_block=tokens_per_block,
-                shm_name=shm_name_for(DeviceType.SSD, self.server_id))
-        self._manual_graph = True
-
-        self.handle = TransferManagerShmChannelHandle(
-            None, None, self.server_id, self.channel_id)
-        return self
-
-    def _init_common(self,
-                     external_index: int,
-                     server_id: Optional[str],
-                     dp_size: int,
-                     instance_num: Optional[int] = None) -> None:
-        """Shared setup: server_id, disjoint id ranges, reserved channel, state."""
         self.external_index = external_index
-        self.instance_num = (instance_num if instance_num is not None
-                             else GLOBAL_CONFIG_FROM_ENV.instance_num)
-        self.server_id = server_id or getattr(
-            GLOBAL_CONFIG_FROM_ENV, "shm_radix_server_id", "default")
+        self.instance_num = instance_num
+        self.server_id = server_id
 
         # Internal DP clients occupy client ids / channel ids [0, total_clients).
         # We live strictly beyond that band.
@@ -213,6 +144,24 @@ class PrefetchController:
         # prefix was already ready in CPU). Useful for benchmarks and tests.
         self.submitted_count = 0
         self.noop_count = 0
+
+        # Attach one RadixClient per source tier directly. num_total_blocks is
+        # cosmetic (capacity is defined by the already-created shm region).
+        self.cpu_engine = CacheEngineRadixShmem(
+            device_type=DeviceType.CPU, num_total_blocks=0,
+            tokens_per_block=tokens_per_block,
+            shm_name=shm_name_for(DeviceType.CPU, self.server_id))
+        self.ssd_engine = None
+        if enable_ssd:
+            self.ssd_engine = CacheEngineRadixShmem(
+                device_type=DeviceType.SSD, num_total_blocks=0,
+                tokens_per_block=tokens_per_block,
+                shm_name=shm_name_for(DeviceType.SSD, self.server_id))
+
+        # CE-side shm channel to the shared TE (created by the FlexKV bootstrap).
+        # The handle attaches purely by (server_id, channel_id).
+        self.handle = TransferManagerShmChannelHandle(
+            None, None, self.server_id, self.channel_id)
 
     # ---- lifecycle ----
 
@@ -279,12 +228,8 @@ class PrefetchController:
 
         task_id = self._gen_task_id()
 
-        if self._manual_graph:
-            graph, callback, task_end_op_id = self._build_prefetch_graph(
-                task_id, token_ids, namespace)
-        else:
-            graph, callback, task_end_op_id = self._get_prefetch_graph_via_ce(
-                task_id, token_ids, namespace)
+        graph, callback, task_end_op_id = self._build_prefetch_graph(
+            task_id, token_ids, namespace)
 
         num_ops = graph.num_ops
         state = _PrefetchState(task_id, callback, task_end_op_id, num_ops)
@@ -306,27 +251,8 @@ class PrefetchController:
 
         return task_id
 
-    def _get_prefetch_graph_via_ce(self, task_id, token_ids, namespace):
-        """Config path: delegate to GlobalCacheEngine.get() (CPU-only upload)."""
-        temp = copy.deepcopy(DEFAULT_CACHE_STRATEGY)
-        temp.ignore_gpu = True   # do not touch GPU
-        temp.ignore_gds = True   # no GDS path
-        fake_slot_mapping = np.zeros_like(token_ids)
-        fake_token_mask = np.ones_like(token_ids)
-        graph, _return_mask, callback, _op_callback_dict, task_end_op_id = \
-            self.cache_engine.get(
-                request_id=task_id,
-                token_ids=token_ids,
-                token_mask=fake_token_mask,
-                slot_mapping=fake_slot_mapping,
-                layer_num=self.num_layers,
-                temp_cache_strategy=temp,
-                namespace=namespace,
-            )
-        return graph, callback, task_end_op_id
-
     def _build_prefetch_graph(self, task_id, token_ids, namespace):
-        """Config-free path: hand-build the SSD->CPU (DISK2H) graph.
+        """Hand-build the SSD->CPU (DISK2H) graph.
 
         Mirrors the collapsed `_get_impl_local` slice for
         ignore_gpu+ignore_gds+no-p2p: a single DISK2H op moving the blocks that
@@ -415,13 +341,12 @@ class PrefetchController:
         # nodes; inserted nodes carry their own armed finalize.
         release_prelocks()
 
-        node_size = cpu_node.size() if cpu_node is not None else 0
-
         def callback():
-            # set_ready THEN unlock — for inserted nodes shmradix fuses both into
-            # the armed finalize fired by unlock(); set_ready is then a no-op.
+            # cpu_node here is always an *inserted* node (insert(is_ready=False)),
+            # so it carries shmradix's armed finalize (= set_ready + dec_ref).
+            # unlock() fires that finalize in one atomic shot — no separate
+            # set_ready needed (set_ready() is a no-op on inserted nodes anyway).
             if cpu_node is not None:
-                self.cpu_engine.set_ready(cpu_node, True, node_size)
                 self.cpu_engine.unlock(cpu_node)
             if cpu_unused is not None and getattr(cpu_unused, "size", 0) > 0:
                 self.cpu_engine.recycle(cpu_unused)

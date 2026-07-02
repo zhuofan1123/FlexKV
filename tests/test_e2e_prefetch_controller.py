@@ -215,8 +215,8 @@ def _external_prefetch_proc(server_id, dp_size, ssd_dir, ready_evt, wrote_evt,
         # small settle so the TE ctrl ready flag is observable
         time.sleep(0.5)
 
-        # Config-free attach: only server_id + tokens_per_block + num_layers.
-        pc = PrefetchController.attach(
+        # Config-free: only server_id + tokens_per_block + num_layers.
+        pc = PrefetchController(
             server_id=server_id,
             tokens_per_block=TOKENS_PER_BLOCK,
             num_layers=model_config.num_layers,
