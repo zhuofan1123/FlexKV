@@ -51,14 +51,15 @@ from flexkv.transfer.shm_channel_handle import TransferManagerShmChannelHandle
 
 
 class _PrefetchState:
-    __slots__ = ("task_id", "callback", "task_end_op_id", "done", "num_ops")
+    __slots__ = ("task_id", "callback", "task_end_op_id", "num_ops", "num_blocks")
 
-    def __init__(self, task_id: int, callback, task_end_op_id: int, num_ops: int):
+    def __init__(self, task_id: int, callback, task_end_op_id: int,
+                 num_ops: int, num_blocks: int):
         self.task_id = task_id
         self.callback = callback
         self.task_end_op_id = task_end_op_id
         self.num_ops = num_ops
-        self.done = False
+        self.num_blocks = num_blocks
 
 
 class PrefetchController:
@@ -144,11 +145,17 @@ class PrefetchController:
         self._task_to_graph: Dict[int, int] = {}       # task_id -> graph_id
         self._started = False
 
-        # Instrumentation: how many prefetch tasks actually submitted a
+        # Cumulative instrumentation: how many prefetch tasks submitted a
         # non-empty graph to the TE (vs. the empty-graph fast path where the
-        # prefix was already ready in CPU). Useful for benchmarks and tests.
+        # prefix was already ready in CPU).
         self.submitted_count = 0
         self.noop_count = 0
+
+        # In-flight gauges: prefetch tasks currently submitted to the TE but not
+        # yet drained (finalize not fired), and the total SSD->CPU blocks they
+        # are moving. Incremented at submit, decremented when poll() finalizes.
+        self.inflight_requests = 0
+        self.inflight_blocks = 0
 
         # Attach one RadixClient per source tier directly. num_total_blocks is
         # cosmetic (capacity is defined by the already-created shm region).
@@ -233,11 +240,12 @@ class PrefetchController:
 
         task_id = self._gen_task_id()
 
-        graph, callback, task_end_op_id = self._build_prefetch_graph(
+        graph, callback, task_end_op_id, num_blocks = self._build_prefetch_graph(
             task_id, token_ids, namespace)
 
         num_ops = graph.num_ops
-        state = _PrefetchState(task_id, callback, task_end_op_id, num_ops)
+        state = _PrefetchState(task_id, callback, task_end_op_id, num_ops,
+                               num_blocks)
         self._task_to_graph[task_id] = graph.graph_id
         self._pending[graph.graph_id] = state
 
@@ -247,11 +255,13 @@ class PrefetchController:
             #   - SSD hit is fully contained in CPU already -> n <= 0
             #   - CPU pool couldn't allocate room           -> aborted
             # We do NOT submit an empty graph to the TE; just run the (possibly
-            # None) callback and mark done so wait() returns immediately.
+            # None) callback and reap so is_done() is immediately True.
             self.noop_count += 1
             self._finish(graph.graph_id)
         else:
             self.submitted_count += 1
+            self.inflight_requests += 1
+            self.inflight_blocks += num_blocks
             self.handle.submit(graph)
 
         return task_id
@@ -301,7 +311,7 @@ class PrefetchController:
             # Nothing to warm (already in CPU, or SSD doesn't have more). Still
             # must drop the match pre-locks.
             release_prelocks()
-            return empty_graph, None, -1
+            return empty_graph, None, -1, 0
 
         ssd_slots = np.asarray(ssd_m.physical_blocks[:ssd_ready], dtype=np.int64)
         # The tail `n` blocks are the ones missing from CPU (CPU has the first
@@ -317,7 +327,7 @@ class PrefetchController:
             # Not enough CPU space even after LRU eviction — skip (do not crash).
             self.cpu_engine.recycle(cpu_slots)
             release_prelocks()
-            return empty_graph, None, -1
+            return empty_graph, None, -1, 0
 
         graph = TransferOpGraph()
         op = TransferOp(
@@ -356,7 +366,7 @@ class PrefetchController:
             if cpu_unused is not None and getattr(cpu_unused, "size", 0) > 0:
                 self.cpu_engine.recycle(cpu_unused)
 
-        return graph, callback, op.op_id
+        return graph, callback, op.op_id, n
 
     # ---- completion draining ----
 
@@ -370,6 +380,10 @@ class PrefetchController:
         if state is None:
             return
         self._task_to_graph.pop(state.task_id, None)
+        # Only submitted (non-empty) graphs were counted as in-flight.
+        if state.num_ops > 0:
+            self.inflight_requests -= 1
+            self.inflight_blocks -= state.num_blocks
         if state.callback is not None:
             try:
                 state.callback()
