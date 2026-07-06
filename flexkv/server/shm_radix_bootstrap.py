@@ -102,6 +102,10 @@ def create_shm_radix_regions(model_config: ModelConfig,
         cfg = shmradix.ShmConfig(
             max_nodes=max_nodes_per_device or max(n_blocks * 2, 200_000),
             max_blocks=n_blocks,
+            # Persist tokens_per_block into the region so any attacher (e.g. an
+            # external prefetch controller) can recover it via
+            # RadixClient.block_size() instead of being told out-of-band.
+            block_size=cache_config.tokens_per_block,
             data_pool_ratio=data_pool_ratio,
             evict_ratio=evict_ratio,
             background_evict=background_evict,

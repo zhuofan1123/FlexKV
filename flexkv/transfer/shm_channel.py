@@ -112,6 +112,10 @@ _LEN_HDR = struct.Struct("<I")
 
 CTRL_WAKE = 0
 CTRL_READY = _CL
+# Number of internal DP clients = first reserved external channel id. Written by
+# the TE on create, read by external attachers (e.g. a prefetch controller) so
+# they can pick a reserved channel without knowing dp_size/instance_num.
+CTRL_TOTAL_CLIENTS = 2 * _CL
 CTRL_SIZE = _PAGE
 
 
@@ -141,6 +145,14 @@ class ShmControlBlock:
         self._base = ctypes.addressof(ctypes.c_char.from_buffer(self.buf))
         self._wake = ctypes.c_int32.from_address(self._base + CTRL_WAKE)
         self._ready = ctypes.c_int32.from_address(self._base + CTRL_READY)
+        self._total_clients = ctypes.c_int32.from_address(
+            self._base + CTRL_TOTAL_CLIENTS)
+
+    def set_total_clients(self, n: int) -> None:
+        self._total_clients.value = int(n)
+
+    def get_total_clients(self) -> int:
+        return self._total_clients.value
 
     @property
     def _wake_addr(self) -> int:

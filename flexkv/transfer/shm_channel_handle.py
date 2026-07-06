@@ -153,10 +153,12 @@ class _TEShmDispatcher:
          this after the TM has finished initializing.
     """
 
-    def __init__(self, server_id: str, num_channels: int):
+    def __init__(self, server_id: str, num_channels: int,
+                 total_clients: int = 0):
         self._tm = None
         self._server_id = server_id
         self._num_channels = num_channels
+        self._total_clients = total_clients
         self._ctrl: Optional[ShmControlBlock] = None
         self._channels: List[ShmChannel] = []
         # graph_id -> channel_id (submitter)
@@ -170,13 +172,16 @@ class _TEShmDispatcher:
         """Create shm control block + per-channel files. Idempotent w.r.t. CE
         attaches — CE-side handles only need these files to exist."""
         self._ctrl = ShmControlBlock(self._server_id, create=True)
+        # Publish the internal DP client count = first reserved external channel
+        # id, so external attachers can auto-pick a reserved slot.
+        self._ctrl.set_total_clients(self._total_clients)
         self._channels = [
             ShmChannel(self._server_id, ch_id, create=True)
             for ch_id in range(self._num_channels)
         ]
         flexkv_logger.info(
             f"TE shm dispatcher: {self._num_channels} channels created on "
-            f"server_id={self._server_id}"
+            f"server_id={self._server_id} (total_clients={self._total_clients})"
         )
 
     def start_dispatch(self, transfer_manager) -> None:
@@ -289,7 +294,8 @@ def te_shm_main(model_config: ModelConfig,
                 num_channels: int,
                 start_event,
                 ready_event,
-                stop_event) -> None:
+                stop_event,
+                total_clients: int = 0) -> None:
     """Entrypoint for the TE subprocess in `mode="shm"`.
 
     Mirrors `TransferManagerInterProcessHandle._process_worker` but replaces
@@ -308,7 +314,7 @@ def te_shm_main(model_config: ModelConfig,
         os.environ["MPI4PY_RC_INITIALIZE"] = "false"
 
         # Phase 1: create shm channels — CE side can attach now.
-        dispatcher = _TEShmDispatcher(server_id, num_channels)
+        dispatcher = _TEShmDispatcher(server_id, num_channels, total_clients)
         dispatcher.setup_channels()
         # Signal start (but not ready) so the parent's `_start_event.wait()`
         # returns. Ready flag is set later by start_dispatch().

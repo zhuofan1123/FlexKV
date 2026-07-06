@@ -25,13 +25,14 @@ Why this is safe to run alongside internal FlexKV:
     completion delivered to our channel is ours and internal FlexKV never sees
     our graph_ids (and vice versa).
 
-Prerequisites (must match the running FlexKV instance):
-  * `FLEXKV_RADIX_SHMEM=1` and the same `shm_radix_server_id`.
-  * The same `tokens_per_block` / `num_cpu_blocks` / `num_ssd_blocks` / model
-    KV geometry, so the attached radix regions and the TE agree on layout.
+Prerequisites (the running FlexKV instance provides these via shm; the caller
+only needs the server_id):
+  * FlexKV running in radix_shmem mode with a known `shm_radix_server_id`.
   * The FlexKV bootstrap must have reserved at least one extra TE channel
-    (`num_extra_te_channels >= 1`, default 1) so `channel_id = total_clients +
-    external_index` exists.
+    (`num_extra_te_channels >= 1`, default 1) so a reserved channel exists at
+    `channel_id = total_clients` (published in the TE ctrl block).
+  * tokens_per_block is recovered from the radix region itself
+    (RadixClient.block_size()); no need to pass model KV geometry.
 
 This controller only does prefetch (SSD/Remote -> CPU, `ignore_gpu=True`), so it
 never registers GPU blocks and never touches internal DP GPU memory.
@@ -39,14 +40,17 @@ never registers GPU blocks and never touches internal DP GPU memory.
 from __future__ import annotations
 
 import contextlib
+import fcntl
+import os
 import threading
+import time
 from typing import Dict, List, Optional
 
 import numpy as np
 
-from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.transfer import DeviceType, TransferOp, TransferOpGraph, TransferType
+from flexkv.transfer.shm_channel import ShmControlBlock, _safe_id
 from flexkv.transfer.shm_channel_handle import TransferManagerShmChannelHandle
 
 
@@ -67,25 +71,24 @@ class PrefetchController:
 
     Attaches directly to the shared CPU (+ SSD) radix regions as RadixClients and
     hand-builds the DISK2H graph, submitting it to the shared TransferEngine over
-    a reserved shm channel. No FlexKVConfig / model-geometry / block-count math:
-    the only values that matter are
+    a reserved shm channel. Everything but `server_id` is auto-discovered from
+    shm:
+      - tokens_per_block : read from the radix region (RadixClient.block_size()).
+      - channel_id       : -1 (default) auto-resolves to the first reserved
+                           external channel (= total_clients, read from the TE
+                           ctrl block); pass an explicit id to override.
+      - layer count      : op uses layer_granularity=-1; the TE fills its own.
 
-      - server_id          : names the shm radix regions + TE channels
-      - tokens_per_block    : block-hash boundary; MUST equal vLLM block_size
-      - num_layers          : transfer op layer_granularity
-      - enable_ssd/remote   : which source tiers exist
-      - instance_num/dp_size: to place channel_id beyond internal DP clients
-
-    Block counts / byte layout are irrelevant (capacity comes from the shm
-    region; byte offsets are computed by the TE from its own registered layout).
+    A flock on the chosen channel is held as insurance: if a second external
+    controller targets the same channel it fails loudly instead of silently
+    sharing the ring. The kernel releases the lock on exit (incl. crash).
 
     Usage:
-        pc = PrefetchController(server_id="node0", tokens_per_block=16,
-                                num_layers=64)
+        pc = PrefetchController(server_id="node0")
         pc.start()                         # ready + starts background drain
         tid = pc.prefetch(token_ids)       # fire-and-forget from any thread
         ...                                # optionally check pc.is_done(tid)
-        pc.shutdown()                      # stops the drain thread
+        pc.shutdown()                      # stops drain thread, releases lock
 
     start() launches a daemon thread that drains completions every ~1 ms and
     fires each task's finalize (set_ready + dec_ref). The caller's thread only
@@ -96,36 +99,35 @@ class PrefetchController:
     def __init__(self,
                  *,
                  server_id: str,
-                 tokens_per_block: int,
-                 num_layers: int,
-                 external_index: int = 0,
-                 enable_ssd: bool = True,
-                 instance_num: int = 1,
-                 dp_size: int = 1):
+                 channel_id: int = -1,
+                 enable_ssd: bool = True):
         from flexkv.cache.radix_shmem_engine import CacheEngineRadixShmem
         from flexkv.server.shm_radix_bootstrap import shm_name_for
 
-        self.num_layers = num_layers
-        self.tokens_per_block = tokens_per_block
-
-        self.external_index = external_index
-        self.instance_num = instance_num
         self.server_id = server_id
+        self._ext_lock_fd: Optional[int] = None
 
-        # Internal DP clients occupy client ids / channel ids [0, total_clients).
-        # We live strictly beyond that band.
-        total_clients = self.instance_num * dp_size
+        # Read the TE ctrl block to discover total_clients (= first reserved
+        # external channel). Poll for the ctrl file since the TE may still be
+        # coming up (same wait discipline as TransferManagerShmChannelHandle).
+        self._ctrl = self._attach_ctrl(server_id)
+        total_clients = self._ctrl.get_total_clients()
         self.total_clients = total_clients
-        self.external_client_id = total_clients + external_index
-        self.channel_id = total_clients + external_index
 
-        num_extra = getattr(GLOBAL_CONFIG_FROM_ENV, "num_extra_te_channels", 1)
-        if external_index >= num_extra:
+        # Resolve channel_id: -1 -> first reserved slot.
+        if channel_id < 0:
+            channel_id = total_clients
+        elif channel_id < total_clients:
             raise ValueError(
-                f"external_index={external_index} exceeds reserved extra TE "
-                f"channels ({num_extra}); increase FLEXKV_NUM_EXTRA_TE_CHANNELS "
-                f"on the FlexKV bootstrap process."
-            )
+                f"channel_id={channel_id} is inside the internal DP band "
+                f"[0, {total_clients}); external channels start at "
+                f"{total_clients}.")
+        self.channel_id = channel_id
+        self.external_client_id = channel_id
+
+        # flock insurance: exclusive-claim this channel across processes. Kernel
+        # auto-releases on exit/crash, so no stale-slot cleanup is needed.
+        self._acquire_ext_lock(server_id, channel_id)
 
         # Claim a disjoint graph_id / op_id range so our completions are cleanly
         # isolated from internal FlexKV's (routing is graph_id based). 2^32 ids
@@ -167,23 +169,53 @@ class PrefetchController:
         self.inflight_requests = 0
         self.inflight_blocks = 0
 
-        # Attach one RadixClient per source tier directly. num_total_blocks is
-        # cosmetic (capacity is defined by the already-created shm region).
+        # Attach one RadixClient per source tier. tokens_per_block=-1 => recover
+        # it from the region (RadixClient.block_size()); num_total_blocks is
+        # cosmetic (capacity comes from the already-created shm region).
         self.cpu_engine = CacheEngineRadixShmem(
             device_type=DeviceType.CPU, num_total_blocks=0,
-            tokens_per_block=tokens_per_block,
+            tokens_per_block=-1,
             shm_name=shm_name_for(DeviceType.CPU, self.server_id))
+        self.tokens_per_block = self.cpu_engine.tokens_per_block
         self.ssd_engine = None
         if enable_ssd:
             self.ssd_engine = CacheEngineRadixShmem(
                 device_type=DeviceType.SSD, num_total_blocks=0,
-                tokens_per_block=tokens_per_block,
+                tokens_per_block=-1,
                 shm_name=shm_name_for(DeviceType.SSD, self.server_id))
 
         # CE-side shm channel to the shared TE (created by the FlexKV bootstrap).
         # The handle attaches purely by (server_id, channel_id).
         self.handle = TransferManagerShmChannelHandle(
             None, None, self.server_id, self.channel_id)
+
+    @staticmethod
+    def _attach_ctrl(server_id: str,
+                     wait_timeout_s: float = 60.0) -> ShmControlBlock:
+        safe = _safe_id(server_id)
+        ctrl_path = f"/dev/shm/flexkv_te_ctrl_{safe}"
+        deadline = time.monotonic() + wait_timeout_s
+        while time.monotonic() < deadline:
+            if os.path.exists(ctrl_path):
+                return ShmControlBlock(server_id, create=False)
+            time.sleep(0.05)
+        raise RuntimeError(
+            f"PrefetchController: TE ctrl block {ctrl_path} not found in "
+            f"{wait_timeout_s}s — is FlexKV (radix_shmem) running for "
+            f"server_id={server_id}?")
+
+    def _acquire_ext_lock(self, server_id: str, channel_id: int) -> None:
+        safe = _safe_id(server_id)
+        path = f"/dev/shm/flexkv_te_extlock_{safe}_{channel_id}"
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise RuntimeError(
+                f"another external PrefetchController already holds channel "
+                f"{channel_id} for server {server_id} (flock on {path})")
+        self._ext_lock_fd = fd
 
     # ---- lifecycle ----
 
@@ -240,6 +272,16 @@ class PrefetchController:
         # NOT unlink shm or tear them down here.
         with contextlib.suppress(Exception):
             self.handle.shutdown()
+        # Release the channel flock (kernel also releases on process exit).
+        if self._ext_lock_fd is not None:
+            with contextlib.suppress(Exception):
+                fcntl.flock(self._ext_lock_fd, fcntl.LOCK_UN)
+                os.close(self._ext_lock_fd)
+            self._ext_lock_fd = None
+        if getattr(self, "_ctrl", None) is not None:
+            with contextlib.suppress(Exception):
+                self._ctrl.close()
+            self._ctrl = None
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
@@ -377,7 +419,9 @@ class PrefetchController:
             src_block_ids=np.asarray(src_ssd, dtype=np.int64),
             dst_block_ids=np.asarray(cpu_slots, dtype=np.int64),
             layer_id=0,
-            layer_granularity=self.num_layers,
+            # -1 => TE fills its own registered layer count (from vLLM's GPU
+            # layout); the controller needn't know num_layers.
+            layer_granularity=-1,
         )
         graph.add_transfer_op(op)
 

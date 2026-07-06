@@ -191,6 +191,7 @@ class KVManager:
                 gpu_register_port=self.gpu_register_port,
                 server_id=server_id,
                 num_channels=total_clients + num_extra,
+                total_clients=total_clients,
             )
             self._shm_te_process.start()
         else:

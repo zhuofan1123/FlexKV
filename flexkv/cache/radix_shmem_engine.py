@@ -101,7 +101,7 @@ class CacheEngineRadixShmem:
     def __init__(self,
                  device_type: DeviceType,
                  num_total_blocks: int,
-                 tokens_per_block: int,
+                 tokens_per_block: int,  # -1 => recover from region via block_size()
                  shm_name: str,
                  evict_ratio: float = 0.05,
                  evict_start_threshold: float = 1.0,
@@ -129,7 +129,6 @@ class CacheEngineRadixShmem:
             )
 
         self.device_type = device_type
-        self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
         self.evict_start_threshold = evict_start_threshold
@@ -141,6 +140,12 @@ class CacheEngineRadixShmem:
         # RadixClient attaches to a shm region created by a RadixServer owned
         # by the bootstrap process.
         self._tree = shmradix.RadixClient(shm_name)
+
+        # -1 => recover tokens_per_block from the region itself
+        # (RadixClient.block_size(), written by the owner on create).
+        if tokens_per_block is None or tokens_per_block < 0:
+            tokens_per_block = int(self._tree.block_size())
+        self.tokens_per_block = tokens_per_block
 
     # ---------- Mempool view (compatibility shims for CacheEngineAccel API) ----------
 
