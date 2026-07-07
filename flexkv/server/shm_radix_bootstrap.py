@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
@@ -85,8 +85,7 @@ class ShmRadixOwners:
 def create_shm_radix_regions(model_config: ModelConfig,
                              cache_config: CacheConfig,
                              server_id: str,
-                             max_nodes_per_device: Optional[int] = None,
-                             data_pool_ratio: int = 5,
+                             data_pool_ratio: int = 8,
                              evict_ratio: float = 0.05,
                              background_evict: bool = True) -> ShmRadixOwners:
     """Called by the bootstrap (instance 0, dp 0) process to create the
@@ -100,7 +99,9 @@ def create_shm_radix_regions(model_config: ModelConfig,
         if n_blocks <= 0:
             continue
         cfg = shmradix.ShmConfig(
-            max_nodes=max_nodes_per_device or max(n_blocks * 2, 200_000),
+            # A radix node holds >= 1 block, so node count won't exceed the
+            # block count — size the node pool to n_blocks.
+            max_nodes=n_blocks,
             max_blocks=n_blocks,
             # Persist tokens_per_block into the region so any attacher (e.g. an
             # external prefetch controller) can recover it via
