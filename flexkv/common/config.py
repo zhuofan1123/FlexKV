@@ -756,6 +756,11 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # prefetch controller attaching to the shared radix index) submit graphs to
     # the single TE via channel_ids in [total_clients, total_clients + extra).
     num_extra_te_channels=int(os.getenv('FLEXKV_NUM_EXTRA_TE_CHANNELS', 1)),
+    # When True, an external prefetch controller is responsible for warming
+    # SSD->CPU ahead of the engine's GET, so the engine's own GET matches CPU
+    # only (cpu_only=True) and never walks the slow SSD (DISK2H) path itself.
+    # When False, the engine GET matches CPU+SSD as usual.
+    prefetch_enabled=bool(int(os.getenv('FLEXKV_PREFETCH_ENABLED', 0))),
 
     index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
     cpu_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_CPU_LAYOUT', 'BLOCKFIRST').upper()),
