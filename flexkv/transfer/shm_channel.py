@@ -93,9 +93,15 @@ OFF_RESULT_WAKE = 5 * _CL
 HEADER_SIZE = 6 * _CL  # 384 B
 
 # Default sizing — overridable via constructor for tests.
-DEFAULT_SUBMIT_SLOTS = 256          # power of 2
+# NOTE: raised for the overload case — at high QPS the vLLM adapter batches many
+# GET tasks into one TransferOpGraph (as_batch=True), whose pickled payload can
+# exceed the old 64 KB slot (observed 68 KB @2500 → EngineCore crash) and the
+# submit ring can fill faster than the single TE drains it (ring-full crash).
+DEFAULT_SUBMIT_SLOTS = 4096         # power of 2 — was 256; absorb overload bursts
 DEFAULT_RESULT_SLOTS = 256          # power of 2
-DEFAULT_SLOT_SIZE = 64 * 1024       # 64 KB; transfer graphs are small
+DEFAULT_SLOT_SIZE = 256 * 1024      # 256 KB — was 64 KB; prefetch grows CPU hits
+                                    # → bigger batched graphs (observed 152 KB @2500
+                                    # with prefetch, overflowing 128 KB)
 
 _PAGE = 4096
 
