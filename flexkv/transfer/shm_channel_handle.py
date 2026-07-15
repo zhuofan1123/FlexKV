@@ -235,6 +235,13 @@ class _TEShmDispatcher:
                         )
                         continue
                     graph = m.graph
+                    # Tag prefetch graphs so the scheduler deprioritizes them
+                    # (background bucket). Internal engine channels are
+                    # 0..total_clients-1; external prefetch controllers attach at
+                    # channel_id >= total_clients (see PrefetchController). Nothing
+                    # synchronously waits on prefetch DISK2H, so it yields to
+                    # engine H2D under a submission burst.
+                    graph.is_prefetch = (ch.channel_id >= self._total_clients)
                     with self._owner_lock:
                         self._graph_owner[graph.graph_id] = ch.channel_id
                     self._tm.submit(graph)

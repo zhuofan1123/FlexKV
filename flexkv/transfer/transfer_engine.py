@@ -1045,7 +1045,15 @@ class TransferEngine:
                                 # Handle batch submission (list of graphs)
                                 graphs = transfer_graph if isinstance(transfer_graph, list) else [transfer_graph]
                                 for graph in graphs:
-                                    self.scheduler.add_transfer_graph(graph)
+                                    # is_prefetch tag (set by the shm dispatcher's
+                                    # _poll_submits for external prefetch channels)
+                                    # routes the graph to the scheduler's background
+                                    # bucket. Absent on non-prefetch/single-engine
+                                    # paths -> foreground (default), behaviour
+                                    # unchanged.
+                                    self.scheduler.add_transfer_graph(
+                                        graph,
+                                        is_prefetch=getattr(graph, "is_prefetch", False))
                                 new_graphs_num += len(graphs)
                             except queue.Empty:
                                 break
