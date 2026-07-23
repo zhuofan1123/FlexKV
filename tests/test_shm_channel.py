@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import pickle
+import threading
 import time
 
+import numpy as np
 import pytest
 
 from flexkv.common.transfer import CompletedOp
@@ -140,6 +143,115 @@ def test_single_round_trip_local():
         out = ch.result_recv(timeout_s=0.0)
         assert out == sent
         assert out[1].is_graph_completed()
+    finally:
+        ch.close()
+        ch.unlink()
+        ctrl.close()
+        ctrl.unlink()
+
+
+def test_submit_fragmentation():
+    """A payload larger than one slot must fragment and round-trip intact,
+    interleaved with small single-slot messages."""
+    server_id = f"{SERVER_ID}_frag"
+    _cleanup_shm(server_id, 1)
+    ctrl = ShmControlBlock(server_id, create=True)
+    # Small slots so a modest payload spans many fragments.
+    ch = ShmChannel(server_id, 0, create=True,
+                    submit_slots=1024, slot_size=4096)
+    try:
+        big = {"arr": np.arange(200_000, dtype=np.int64)}  # ~1.5 MB > slot
+        small = {"k": 1}
+        ch.submit_send(small)
+        ch.submit_send(big)
+        ch.submit_send(small)
+        msgs = ch.submit_recv()
+        assert len(msgs) == 3
+        assert msgs[0] == small
+        assert np.array_equal(msgs[1]["arr"], big["arr"])
+        assert msgs[2] == small
+    finally:
+        ch.close()
+        ch.unlink()
+        ctrl.close()
+        ctrl.unlink()
+
+
+def test_submit_payload_too_large():
+    """A payload that can't fit the whole ring is rejected, not deadlocked."""
+    server_id = f"{SERVER_ID}_toobig"
+    _cleanup_shm(server_id, 1)
+    ctrl = ShmControlBlock(server_id, create=True)
+    ch = ShmChannel(server_id, 0, create=True,
+                    submit_slots=8, slot_size=4096)
+    try:
+        with pytest.raises(ValueError):
+            ch.submit_send(b"x" * (8 * 4096))  # needs more fragments than slots
+    finally:
+        ch.close()
+        ch.unlink()
+        ctrl.close()
+        ctrl.unlink()
+
+
+def _make_big_graph(nbytes: int) -> dict:
+    """A graph-shaped payload that pickles to ~nbytes (block-id arrays dominate)."""
+    n = nbytes // 16  # two int64 arrays
+    return {"src": np.arange(n, dtype=np.int64),
+            "dst": np.arange(n, dtype=np.int64)}
+
+
+def test_submit_big_graph_500kb():
+    """A ~500 KB graph fragments across the default 32 KB slots and round-trips."""
+    server_id = f"{SERVER_ID}_big500"
+    _cleanup_shm(server_id, 1)
+    ctrl = ShmControlBlock(server_id, create=True)
+    ch = ShmChannel(server_id, 0, create=True)  # default 32 KB / 8192
+    try:
+        big = _make_big_graph(500 * 1024)
+        blob_sz = len(pickle.dumps(big, protocol=pickle.HIGHEST_PROTOCOL))
+        assert blob_sz > 500 * 1024, f"payload only {blob_sz} B"
+        assert blob_sz > ch.slot_size, "payload must exceed one slot"
+        ch.submit_send(big)
+        out = ch.submit_recv()
+        assert len(out) == 1
+        assert np.array_equal(out[0]["src"], big["src"])
+        assert np.array_equal(out[0]["dst"], big["dst"])
+    finally:
+        ch.close()
+        ch.unlink()
+        ctrl.close()
+        ctrl.unlink()
+
+
+def test_submit_small_graphs_high_rate():
+    """4096 small multi-slot graphs at ~4096/s: a producer thread submits while a
+    consumer thread drains, verifying no loss, correct order, and no ring-full
+    stall at the default 8192-slot capacity."""
+    server_id = f"{SERVER_ID}_hirate"
+    _cleanup_shm(server_id, 1)
+    ctrl = ShmControlBlock(server_id, create=True)
+    ch = ShmChannel(server_id, 0, create=True)  # default 32 KB / 8192
+    n_msgs = 4096
+    small = {"payload": b"x" * (2 * ch.slot_size)}  # spans ~3 slots each
+    received: list = []
+
+    def consumer() -> None:
+        while len(received) < n_msgs:
+            received.extend(ch.submit_recv())
+
+    try:
+        t = threading.Thread(target=consumer, daemon=True)
+        t.start()
+        start = time.monotonic()
+        for i in range(n_msgs):
+            ch.submit_send({"seq": i, **small})
+        t.join(timeout=30.0)
+        elapsed = time.monotonic() - start
+        assert len(received) == n_msgs, f"got {len(received)}/{n_msgs}"
+        assert [m["seq"] for m in received] == list(range(n_msgs)), "order/loss"
+        rate = n_msgs / elapsed
+        assert rate >= 4096, f"throughput {rate:.0f}/s below 4096/s target"
     finally:
         ch.close()
         ch.unlink()
