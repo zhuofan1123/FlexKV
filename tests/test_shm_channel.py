@@ -15,6 +15,7 @@ import time
 
 import pytest
 
+from flexkv.common.transfer import CompletedOp
 from flexkv.transfer.shm_channel import ShmChannel, ShmControlBlock
 
 
@@ -25,13 +26,13 @@ def _producer(channel_id: int, n: int, server_id: str) -> None:
     ch = ShmChannel(server_id, channel_id, create=False)
     for i in range(n):
         ch.submit_send({"channel": channel_id, "seq": i, "data": b"x" * 1024})
-    # Wait for echoed acks.
+    # Wait for echoed acks (CompletedOps carrying channel/seq in graph_id/op_id).
     received = 0
     while received < n:
         msgs = ch.result_recv(timeout_s=2.0)
         received += len(msgs)
         for m in msgs:
-            assert m["channel"] == channel_id
+            assert m.graph_id == channel_id
 
 
 def _consumer(num_channels: int, total_per_channel: int, server_id: str) -> None:
@@ -48,7 +49,10 @@ def _consumer(num_channels: int, total_per_channel: int, server_id: str) -> None
             if msgs:
                 had_work = True
                 for m in msgs:
-                    ch.result_send({"channel": m["channel"], "seq": m["seq"]})
+                    # Echo back the (channel, seq) as a CompletedOp — the result
+                    # ring is now typed to CompletedOp records.
+                    ch.result_send([CompletedOp(graph_id=m["channel"],
+                                                op_id=m["seq"])])
                     pending -= 1
         if not had_work:
             time.sleep(0.001)
@@ -125,9 +129,17 @@ def test_single_round_trip_local():
         msgs = ch.submit_recv()
         assert msgs == ["hello", {"k": 42}]
 
-        ch.result_send([1, 2, 3])
+        # Result ring carries fixed-width CompletedOp records; all fields must
+        # round-trip, including the transfer_type string and the -1 sentinel.
+        sent = [
+            CompletedOp(graph_id=7, op_id=3, transfer_type="H2D",
+                        num_blocks=12, num_bytes=98304),
+            CompletedOp(graph_id=7, op_id=-1),  # graph-completed sentinel
+        ]
+        ch.result_send(sent)
         out = ch.result_recv(timeout_s=0.0)
-        assert out == [[1, 2, 3]]
+        assert out == sent
+        assert out[1].is_graph_completed()
     finally:
         ch.close()
         ch.unlink()

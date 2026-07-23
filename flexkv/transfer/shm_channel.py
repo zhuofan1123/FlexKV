@@ -92,16 +92,17 @@ OFF_RESULT_R = 4 * _CL
 OFF_RESULT_WAKE = 5 * _CL
 HEADER_SIZE = 6 * _CL  # 384 B
 
-# Default sizing — overridable via constructor for tests.
-# NOTE: raised for the overload case — at high QPS the vLLM adapter batches many
-# GET tasks into one TransferOpGraph (as_batch=True), whose pickled payload can
-# exceed the old 64 KB slot (observed 68 KB @2500 → EngineCore crash) and the
-# submit ring can fill faster than the single TE drains it (ring-full crash).
-DEFAULT_SUBMIT_SLOTS = 4096         # power of 2 — was 256; absorb overload bursts
-DEFAULT_RESULT_SLOTS = 256          # power of 2
-DEFAULT_SLOT_SIZE = 256 * 1024      # 256 KB — was 64 KB; prefetch grows CPU hits
-                                    # → bigger batched graphs (observed 152 KB @2500
-                                    # with prefetch, overflowing 128 KB)
+# Submit ring holds variable-length pickled TransferOpGraphs. 512KB slots × 4096:
+# high-QPS as_batch=True graphs overflowed the old 128KB slot (observed 152KB
+# @2500 with prefetch), and the deep ring absorbs submit bursts before the single
+# TE drains them.
+DEFAULT_SUBMIT_SLOTS = 4096         # power of 2
+DEFAULT_SUBMIT_SLOT_SIZE = 512 * 1024
+DEFAULT_SLOT_SIZE = DEFAULT_SUBMIT_SLOT_SIZE  # back-compat alias for `slot_size=`
+
+# Result ring holds one fixed-width CompletedOp record per slot (64 B × 65536 = 4 MB).
+DEFAULT_RESULT_SLOTS = 65536        # power of 2
+DEFAULT_RESULT_SLOT_SIZE = 64       # cache line; one 29 B CompletedOp record
 
 _PAGE = 4096
 
@@ -110,8 +111,47 @@ def _round_up(x: int, m: int) -> int:
     return (x + m - 1) // m * m
 
 
-# Length-prefix struct: 4-byte LE uint32 prefix in front of each pickle blob.
+# Length-prefix for submit-ring pickle blobs.
 _LEN_HDR = struct.Struct("<I")
+
+
+# CompletedOp result-ring record: graph_id/op_id (i64), transfer_type (u8 index),
+# num_blocks (u32), num_bytes (u64).
+_COMPLETED_OP = struct.Struct("<qqBIQ")
+COMPLETED_OP_WIRE_SIZE = _COMPLETED_OP.size
+
+# transfer_type frozen as a byte index; 0xFF = None (VIRTUAL ops).
+_TT_NONE = 0xFF
+_TT_NAMES = (
+    "H2D", "D2H", "DISK2H", "H2DISK", "DISK2D", "D2DISK",
+    "REMOTE2H", "H2REMOTE", "PEERH2H", "H2PEERH", "PEERSSD2H", "H2PEERSSD",
+    "VIRTUAL",
+)
+_TT_NAME_TO_IDX = {name: i for i, name in enumerate(_TT_NAMES)}
+
+
+def encode_completed_op(op: Any) -> bytes:
+    """Pack a CompletedOp into its 29-byte fixed-width record."""
+    tt = op.transfer_type
+    tt_idx = _TT_NONE if tt is None else _TT_NAME_TO_IDX[tt]
+    return _COMPLETED_OP.pack(
+        op.graph_id, op.op_id, tt_idx, op.num_blocks, op.num_bytes,
+    )
+
+
+def decode_completed_op(buf: Any, off: int) -> Any:
+    """Unpack a CompletedOp record from `buf` at byte offset `off`."""
+    from flexkv.common.transfer import CompletedOp
+    graph_id, op_id, tt_idx, num_blocks, num_bytes = \
+        _COMPLETED_OP.unpack_from(buf, off)
+    tt = None if tt_idx == _TT_NONE else _TT_NAMES[tt_idx]
+    return CompletedOp(
+        graph_id=graph_id,
+        op_id=op_id,
+        transfer_type=tt,
+        num_blocks=num_blocks,
+        num_bytes=num_bytes,
+    )
 
 
 # ── ShmControlBlock ─────────────────────────────────────────────────────
@@ -221,16 +261,21 @@ class ShmChannel:
                  create: bool = False,
                  submit_slots: int = DEFAULT_SUBMIT_SLOTS,
                  result_slots: int = DEFAULT_RESULT_SLOTS,
-                 slot_size: int = DEFAULT_SLOT_SIZE):
+                 slot_size: int = DEFAULT_SUBMIT_SLOT_SIZE,
+                 result_slot_size: int = DEFAULT_RESULT_SLOT_SIZE):
         assert submit_slots & (submit_slots - 1) == 0, \
             "submit_slots must be power of 2"
         assert result_slots & (result_slots - 1) == 0, \
             "result_slots must be power of 2"
+        assert result_slot_size >= COMPLETED_OP_WIRE_SIZE, \
+            f"result_slot_size {result_slot_size} < CompletedOp record " \
+            f"{COMPLETED_OP_WIRE_SIZE}"
 
         self.channel_id = channel_id
         self.submit_slots = submit_slots
         self.result_slots = result_slots
-        self.slot_size = slot_size
+        self.slot_size = slot_size  # submit ring; result ring uses result_slot_size
+        self.result_slot_size = result_slot_size
 
         safe = _safe_id(server_id)
         self.shm_path = f"/dev/shm/flexkv_te_ch_{safe}_{channel_id}"
@@ -238,7 +283,7 @@ class ShmChannel:
         # Lay out: header -> aligned to page -> submit ring -> result ring.
         self._submit_off = _round_up(HEADER_SIZE, _PAGE)
         self._result_off = self._submit_off + submit_slots * slot_size
-        total = self._result_off + result_slots * slot_size
+        total = self._result_off + result_slots * result_slot_size
 
         self.total_size = total
 
@@ -318,7 +363,8 @@ class ShmChannel:
         self._bump_wake(self._submit_wake, self._submit_wake_addr)
 
     def result_recv(self, timeout_s: Optional[float] = None) -> List[Any]:
-        """Drain pending TE→CE results. Blocks up to `timeout_s` if empty."""
+        """Drain pending TE→CE results, one CompletedOp per slot. Blocks up to
+        `timeout_s` if empty."""
         out: List[Any] = []
         rp = self._result_r.value
         wp = self._result_w.value
@@ -336,8 +382,8 @@ class ShmChannel:
                 wp = self._result_w.value
 
         while rp != wp:
-            blob = self._read_blob(self._result_off + rp * self.slot_size)
-            out.append(pickle.loads(blob))
+            out.append(decode_completed_op(
+                self.buf, self._result_off + rp * self.result_slot_size))
             rp = (rp + 1) & (slots - 1)
         if out:
             self._result_r.value = rp
@@ -359,22 +405,41 @@ class ShmChannel:
             self._submit_r.value = rp
         return out
 
-    def result_send(self, payload: Any) -> None:
-        """Enqueue a result to CE."""
-        blob = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
-        wp = self._result_w.value
+    def result_send(self, ops: List[Any]) -> None:
+        """Enqueue a batch of CompletedOps, one fixed-width record per slot, and
+        wake the CE once at the end. Spins if the ring fills rather than dropping a
+        completion (which would hang the owning task); with 65536 slots that is
+        effectively unreachable."""
+        if not ops:
+            return
         slots = self.result_slots
-        for spin in range(1_000_000):
-            rp = self._result_r.value
-            if not self._ring_full(wp, rp, slots):
-                break
-            if spin > 1000:
-                os.sched_yield()
-        else:
-            raise RuntimeError("shm channel result ring full")
-
-        self._write_blob(self._result_off + wp * self.slot_size, blob)
-        self._result_w.value = (wp + 1) & (slots - 1)
+        slot_sz = self.result_slot_size
+        base = self._result_off
+        wp = self._result_w.value
+        warned = False
+        for op in ops:
+            if self._ring_full(wp, self._result_r.value, slots):
+                # Full mid-batch: publish+wake so the CE drains, then spin.
+                self._bump_wake(self._result_wake, self._result_wake_addr)
+                spin = 0
+                while self._ring_full(wp, self._result_r.value, slots):
+                    if spin > 1000:
+                        os.sched_yield()
+                    spin += 1
+                    if spin % 5_000_000 == 0 and not warned:
+                        try:
+                            from flexkv.common.debug import flexkv_logger
+                            flexkv_logger.error(
+                                f"shm channel result ring stuck full "
+                                f"(slots={slots}); is the CE consumer alive?"
+                            )
+                        except Exception:
+                            pass
+                        warned = True
+            off = base + wp * slot_sz
+            self.buf[off:off + COMPLETED_OP_WIRE_SIZE] = encode_completed_op(op)
+            wp = (wp + 1) & (slots - 1)
+            self._result_w.value = wp
         self._bump_wake(self._result_wake, self._result_wake_addr)
 
     # ---- Submit-wake fileno: lets TE selector wait on this channel ----

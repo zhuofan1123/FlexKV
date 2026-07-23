@@ -40,11 +40,7 @@ class _SubmitMsg:
         self.is_batch = is_batch
 
 
-class _ResultMsg:
-    __slots__ = ("ops",)
-
-    def __init__(self, ops: List[CompletedOp]):
-        self.ops = ops
+# The result ring carries fixed-width CompletedOp records directly (no wrapper).
 
 
 # CE-side handle ---------------------------------------------------------
@@ -116,11 +112,14 @@ class TransferManagerShmChannelHandle:
     def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         if timeout is None:
             timeout = 0.0
-        msgs = self._channel.result_recv(timeout_s=timeout)
-        out: List[CompletedOp] = []
-        for m in msgs:
-            if isinstance(m, _ResultMsg):
-                out.extend(m.ops)
+        out: List[CompletedOp] = self._channel.result_recv(timeout_s=timeout)
+        if out and os.environ.get("FLEXKV_TRACE_TE", "0") == "1":
+            completed_graphs = sorted({op.graph_id for op in out
+                                        if op.is_graph_completed()})
+            flexkv_logger.info(
+                f"[TE-TRACE] CE recv ch={self.channel_id} "
+                f"completed_graphs={completed_graphs} n_ops={len(out)}"
+            )
         return out
 
     def shutdown(self) -> None:
@@ -291,7 +290,7 @@ class _TEShmDispatcher:
                 by_channel.setdefault(owner, []).append(op)
             for ch_id, ops in by_channel.items():
                 if 0 <= ch_id < len(self._channels):
-                    self._channels[ch_id].result_send(_ResultMsg(ops))
+                    self._channels[ch_id].result_send(ops)
 
 
 def te_shm_main(model_config: ModelConfig,
