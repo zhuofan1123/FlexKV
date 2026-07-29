@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 import numpy as np
 
 
@@ -25,8 +25,10 @@ class MatchResultAccel:
     # the matched path.
     last_swa_node: Optional['CRadixNode'] = None
     swa_hit_blocks: int = 0
+    # radixshmem only: one-shot callable releasing the match's inc_ref on the
+    # ready prefix. cache_engine must call it exactly once (idempotent); None
+    # for backends that don't pre-lock, so callers do `if fn: fn()`.
+    finalize: Optional[Callable[[], None]] = None
 
     def __post_init__(self) -> None:
         assert self.physical_blocks.ndim == 1
-
-
