@@ -1,6 +1,6 @@
 # FlexKV × radixshmem 集成（多 DP 路径）
 
-将 FlexKV 的多 DP 路径从 "N 个 CE 客户端 → zmq → 单 KVServer 进程" 改造为 "N 个 CE 在自己地址空间里 attach 同一段共享 shm radix tree、并行查询，1 个共享 TE 通过 N 条 ShmChannel 接收 transfer graph"。结果是端到端 mean 时延快 3×、QPS 高 70%、命中率不变，并且消除 baseline 路径下高 QPS 时观察到的多种 hang/race。
+将 FlexKV 的多 DP 路径从 "N 个 CE 客户端 → zmq → 单 KVServer 进程" 改造为 "N 个 CE 在自己地址空间里 attach 同一段共享 shm radix tree、并行查询，1 个共享 TE 通过 N 条 ShmChannel 接收 transfer graph"。结果是端到端 mean 时延快 ~2.4×、QPS 高 ~65%、命中率不变，并且消除 baseline 路径下高 QPS 时观察到的多种 hang/race。
 
 ## 目录
 
@@ -310,21 +310,27 @@ per_block_KV = per_token_KV × block_size (16) = 2.25 MB
 
 ### 6.2 R2 高压极限（QPS=4096，max_tokens=1）
 
+> **测量版本**：以下 baseline / shmradix 数据为删除 `flexkv/transfer/worker.py` 里 D2H/H2D worker 多余的 `torch.cuda.synchronize()` 之后重测（参见 §9 第 10 项）。这一行 sync 把本该流水线化的 transfer op 串行成 device-wide drain，对 baseline mean/p50/p95/p99 ~10% degrade，对 shmradix 尾延迟 ~12% degrade。`vllm-only` 不走 FlexKV transfer 路径，数据未变。
+
 | Metric | baseline | shmradix | vllm-only | shmradix vs baseline |
 |---|---:|---:|---:|---:|
-| wall (s) | 4.47 | **2.63** | 13.22 | **−41.3 %** |
-| **observed QPS** | 1832 | **3120** | **620** | **+70.3 %** |
-| lat mean (ms) | 1952 | **694** | 5994 | **−64.4 %** |
-| lat p50 (ms) | 2051 | **702** | 5894 | −65.8 % |
-| lat p95 (ms) | 2750 | **1077** | 10856 | −60.8 % |
-| lat p99 (ms) | 2909 | **1264** | 11036 | −56.5 % |
+| wall (s) | 4.23 | **2.56** | 13.22 | **−39.5 %** |
+| **observed QPS** | 1938 | **3206** | **620** | **+65.4 %** |
+| lat mean (ms) | 1728 | **709** | 5994 | **−59.0 %** |
+| lat p50 (ms) | 1837 | **702** | 5894 | −61.8 % |
+| lat p95 (ms) | 2406 | **951** | 10856 | −60.5 % |
+| lat p99 (ms) | 2612 | **1116** | 11036 | −57.3 % |
 | **FlexKV hit %** | **90.68** | **90.68** | n/a | 完全相同 |
 | qtime get mean (µs) | 1859 | **151** | n/a | −91.9 % |
 | qtime put mean (µs) | 932 | **68** | n/a | −92.7 % |
 
-> 三个 backend 都是 8186 ok / 6 empty / 0 err。vllm-only 比 baseline 慢 3.1 ×，比 shmradix 慢 8.6 ×。
+> 三个 backend 都是 8186 ok / 6 empty / 0 err。vllm-only 比 baseline 慢 3.5 ×，比 shmradix 慢 8.5 ×。
+>
+> qtime（match/put_match 时延）来自 FlexKV query 路径，与被删除的 transfer 端 sync 无关，沿用原 R2 数。
 
 ### 6.3 R1 标准压力（QPS=2048，max_tokens=8）
+
+> R1 未重测；以下为含 sync 的旧数。删除 sync 对 R1 的影响方向与 R2 一致（baseline 全线 ~10%，shmradix 尾延迟 ~12%），相对关系（shmradix vs baseline）变化幅度有限。
 
 | Metric | baseline | shmradix | vllm-only | shmradix vs baseline |
 |---|---:|---:|---:|---:|
@@ -345,14 +351,14 @@ per_block_KV = per_token_KV × block_size (16) = 2.25 MB
 | Cache 容量上限 | 200 GB（CPU） | 200 GB（CPU） | ~24 GB / DP |
 | Query 路径 | zmq → 单 server 串行 | per-DP 本地直查 shm | vllm 进程内 |
 | Multi-DP 实际命中率 | 90.68 % | **90.68 %** | **~12.5 %（1/DP 上限）** |
-| QPS 上限（R2） | ~1830 | **~3120** | ~620 |
+| QPS 上限（R2） | ~1940 | **~3210** | ~620 |
 
 ### 6.5 关键结论
 
 1. **shmradix 和 baseline 命中率完全相同（90.68 %）** —— 二者之间的差距全部来自 query 路径
-2. **baseline QPS 上限 ≈ 1830**（R1 target 2048 跑 1696；R2 target 4096 跑 1832）—— 单 KVServer 串行处理的硬上限
-3. **shmradix QPS 上限 ≈ 3120**（R2），是 baseline 的 1.70 ×
-4. **vllm-only QPS 上限 ≈ 620**（R1/R2 都是），是 baseline 的 0.34 ×、shmradix 的 0.20 × —— 不是因为 vllm 慢，是 multi-DP 路由让 GPU prefix cache 命中率塌
+2. **baseline QPS 上限 ≈ 1940**（R2 target 4096 跑 1938；R1 target 2048 跑 1696）—— 单 KVServer 串行处理的硬上限
+3. **shmradix QPS 上限 ≈ 3210**（R2），是 baseline 的 1.65 ×；mean 时延是 baseline 的 0.41 ×（2.44 × 更快）
+4. **vllm-only QPS 上限 ≈ 620**（R1/R2 都是），是 baseline 的 0.32 ×、shmradix 的 0.19 × —— 不是因为 vllm 慢，是 multi-DP 路由让 GPU prefix cache 命中率塌
 5. **baseline 的 `get_match` 时延随负载剧增**（R1: 1457 µs → R2: 1859 µs），shmradix **完全不随负载变化**（R1: 176 µs → R2: 151 µs）—— scaling 本质区别
 6. **FlexKV 在 multi-DP serving 下的两条独立价值**：(a) cache 跨 DP 共享带来命中率优势；(b) query 路径去 N→1 漏斗带来时延/QPS 优势。shmradix 在 baseline (a) 的基础上再加 (b)
 
@@ -430,6 +436,7 @@ verifier 跑五项垃圾检查：replacement char、控制字符、低熵、priv
 | 7. `--shm-size` 一旦设定，container restart 不能改 | 修不了 | `docker rm` 重建 |
 | 8. `FLEXKV_SHM_RADIX_ID` 重复 | 多个 vllm 实例 attach 同一段 shm tree，状态串了 | 每个实例用唯一 ID |
 | 9. CPU cache 跨 DP 共享、但 GPU KV cache 是 per-DP | 容易混淆容量估算 | 见 §6.1，CPU 是 200 GB 共池，GPU 是 8 × 24 GB 独立 |
+| 10. `flexkv/transfer/worker.py` 里曾在 `_transfer_impl` 后 `torch.cuda.synchronize()` | 把 D2H/H2D op 串行成 device-wide drain，R2 mean / p95 / p99 各 ~10-12% degrade | device-wide sync 已移除；`GPUCPUTransferWorker._transfer_impl` 现把 `sync=True` 下推给 C++ `transfer_kv_blocks`，收尾只做 stream-scoped 的 `cudaStreamSynchronize(stream)`（`csrc/transfer.cu:300`），不再 drain 整个 device。下游 worker 队列自带 stream-aware 排序，多余的 device sync 没有保护任何 invariant。NIXL worker 的 sync（`worker.py:2411`，由 PR #142 引入）属于另一条路径，与本项无关 |
 
 ---
 
