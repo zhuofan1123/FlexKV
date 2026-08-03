@@ -110,7 +110,7 @@ class CacheEngineRadixShmem:
                  event_collector: Optional[KVEventCollector] = None,
                  metrics_collector=None,
                  protected_threshold: int = 2):
-        """Attach to an existing radix shm region by name. The TreeServer
+        """Attach to an existing radix shm region by name. The RadixServer
         owning the region must have been created elsewhere (e.g. by
         `flexkv.server.shm_radix_bootstrap.create_shm_radix_regions`)."""
         _ensure_shmradix()

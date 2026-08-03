@@ -8,6 +8,7 @@ calls `seq.gen_hashes()` and reads `seq.block_hashes`.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import os
 from dataclasses import dataclass
@@ -67,8 +68,12 @@ class FakeSeq:
 
 
 def _make_engine(name: str, blocks: int = 10000, tokens_per_block: int = 4):
+    # Fixed region names are reused across runs; drop any leftover so the
+    # RadixServer creates a fresh region instead of colliding with stale state.
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(f"/dev/shm{name}")
     cfg = shmradix.ShmConfig(max_nodes=blocks * 4, max_blocks=blocks)
-    server = shmradix.TreeServer(name, cfg)
+    server = shmradix.RadixServer(name, cfg)
     engine = CacheEngineRadixShmem(
         device_type=DeviceType.CPU,
         num_total_blocks=blocks,
@@ -105,10 +110,10 @@ def test_take_insert_match_recycle():
     assert r2.num_ready_matched_blocks == 4
     np.testing.assert_array_equal(np.sort(r2.physical_blocks), np.sort(slots))
 
-    # last_node and last_ready_node populated.
-    assert r2.last_node is not None
-    assert r2.last_ready_node is not None
-    assert r2.last_ready_node.node_id == r2.last_node.node_id
+    # radixshmem is split-invariant and exposes no node_id, so match() reports
+    # hit lengths + slots only; last_node / last_ready_node are always None.
+    assert r2.last_node is None
+    assert r2.last_ready_node is None
 
     # Recycle a fresh allocation; tree-attached slots are not affected.
     free_slots = engine.take(num_required_blocks=2, strict=False)
@@ -126,10 +131,10 @@ def test_match_unready_prefix():
     assert r.num_matched_blocks == 6
     # Whole node is unready, so the ready prefix is 0.
     assert r.num_ready_matched_blocks == 0
-    # last_ready_node is None (no ready prefix).
+    # No node_id handles on this backend: both are always None regardless of
+    # readiness. The unready hit is conveyed by num_matched > num_ready above.
     assert r.last_ready_node is None
-    # last_node still set to the unready node.
-    assert r.last_node is not None
+    assert r.last_node is None
 
 
 def test_lock_prevents_eviction():
@@ -162,11 +167,13 @@ def test_eviction_reclaims_unlocked():
 
     seq = FakeSeq(block_hashes=_hashes(seed=4, num=1500))
     s1 = engine.take(num_required_blocks=1500)
-    engine.insert(seq, s1, is_ready=True)
-    # Don't lock. Allocate enough new blocks that eviction is forced (need >
-    # current free 500).
+    node = engine.insert(seq, s1, is_ready=True)
+    # insert() inc_ref's the leaf (lock=True), so it can't be evicted until the
+    # transfer-complete release drops that ref. Release to make it LRU-evictable.
+    engine.release_node(node, ready_length=1500)
+    # Allocate enough new blocks that eviction is forced (need > current free 500).
     s2 = engine.take(num_required_blocks=1500, strict=False)
-    # On the same shm region, eviction reclaimed the unlocked LRU sequence
+    # On the same shm region, eviction reclaimed the now-unlocked LRU sequence
     # so we got more than the initial free count.
     assert len(s2) > 500
 

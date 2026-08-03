@@ -791,9 +791,9 @@ class GlobalCacheEngine:
                                    device_type: DeviceType,
                                    num_blocks: int,
                                    event_collector) -> "object":
-        """Attach to a pre-created radixshmem region as a TreeClient.
+        """Attach to a pre-created radixshmem region as a RadixClient.
 
-        The shm region itself (TreeServer) is owned by the KVManager bootstrap
+        The shm region itself (RadixServer) is owned by the KVManager bootstrap
         process via `flexkv.server.shm_radix_bootstrap.create_shm_radix_regions`.
         Non-bootstrap procs poll for region availability before reaching this
         point, so the attach is unconditional here.
