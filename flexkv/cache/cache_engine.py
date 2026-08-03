@@ -1471,7 +1471,11 @@ class GlobalCacheEngine:
                 cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
                                                                   fragment1_cpu_blocks_local,
                                                                   is_ready=False)
-                op_node_to_ready[op_peerh2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
+                # insert() returns None when nothing was attached (suffix already
+                # in the shared tree) — no unready node to flip ready.
+                if cpu_node_to_unlock is not None:
+                    op_node_to_ready[op_peerh2h.op_id] = (
+                        DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
             else:
                 cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, fragment1_cpu_blocks_local])
 
@@ -1487,9 +1491,10 @@ class GlobalCacheEngine:
                 )
                 transfer_graph.add_transfer_op(op_gds_transfer)
                 finished_ops_ids.append(op_gds_transfer.op_id)
-                op_node_to_ready[op_gds_transfer.op_id] = (DeviceType.SSD,
-                                                           ssd_node_to_unlock,
-                                                           ssd_node_to_unlock.size())
+                if ssd_node_to_unlock is not None:
+                    op_node_to_ready[op_gds_transfer.op_id] = (DeviceType.SSD,
+                                                               ssd_node_to_unlock,
+                                                               ssd_node_to_unlock.size())
             else:
                 fragment2_cpu_blocks = allocated_cpu_blocks[:fragment2_num_blocks]
 
@@ -1516,7 +1521,9 @@ class GlobalCacheEngine:
                                                                         block_mask_start,
                                                                     is_ready=False,
                                                                     match_result=cpu_matched_result)
-                    op_node_to_ready[op_disk2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
+                    if cpu_node_to_unlock is not None:
+                        op_node_to_ready[op_disk2h.op_id] = (
+                            DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
                 else:
                     cpu_blocks_to_free = np.concatenate([cpu_blocks_to_free, fragment2_cpu_blocks])
         if self.cache_config.enable_p2p_cpu and cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
@@ -1892,8 +1899,12 @@ class GlobalCacheEngine:
             is_ready=False,
             match_result=cpu_matched_result,
         )
-        op_node_to_ready[op_d2h.op_id] = (
-            DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
+        # insert() returns None when nothing was attached (the whole suffix was
+        # already present in the shared tree) — then there is no unready node to
+        # flip ready after the transfer, so skip the ready-callback bookkeeping.
+        if cpu_node_to_unlock is not None:
+            op_node_to_ready[op_d2h.op_id] = (
+                DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
         ssd_node_to_unlock = None
         if put_to_ssd:
             ssd_node_to_unlock = self.ssd_cache_engine.insert(
@@ -1902,8 +1913,9 @@ class GlobalCacheEngine:
                 is_ready=False,
                 match_result=ssd_matched_result,
             )
-            op_node_to_ready[op_h2disk.op_id] = (
-                DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
+            if ssd_node_to_unlock is not None:
+                op_node_to_ready[op_h2disk.op_id] = (
+                    DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
         remote_node_to_unlock = None
         if put_to_remote:
             remote_node_to_unlock = self.remote_cache_engine.insert(
@@ -1912,11 +1924,12 @@ class GlobalCacheEngine:
                 is_ready=False,
                 match_result=remote_matched_result,
             )
-            op_node_to_ready[op_h2remote.op_id] = (
-                DeviceType.REMOTE,
-                remote_node_to_unlock,
-                remote_node_to_unlock.size(),
-            )
+            if remote_node_to_unlock is not None:
+                op_node_to_ready[op_h2remote.op_id] = (
+                    DeviceType.REMOTE,
+                    remote_node_to_unlock,
+                    remote_node_to_unlock.size(),
+                )
         on_complete: List[Callable[[], None]] = []
         if cpu_node_to_unlock is not None:
             on_complete.append(self._defer_node_release(DeviceType.CPU,
@@ -2136,7 +2149,10 @@ class GlobalCacheEngine:
             is_ready=False,
             match_result=cpu_matched_result,
         )
-        op_node_to_ready[op_d2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
+        # insert() returns None when nothing was attached (suffix already in the
+        # shared tree) — no unready node to flip ready after the transfer.
+        if cpu_node_to_unlock is not None:
+            op_node_to_ready[op_d2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
         ssd_node_to_unlock = None
         if len(fragment2_ssd_blocks) > 0:
             ssd_node_to_unlock = self.ssd_cache_engine.insert(
@@ -2145,7 +2161,8 @@ class GlobalCacheEngine:
                 is_ready=False,
                 match_result=ssd_matched_result,
             )
-            op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
+            if ssd_node_to_unlock is not None:
+                op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
         on_complete: List[Callable[[], None]] = []
         if cpu_node_to_unlock is not None:
             on_complete.append(self._defer_node_release(DeviceType.CPU,
