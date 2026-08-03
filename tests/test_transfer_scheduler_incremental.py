@@ -351,8 +351,10 @@ def test_matches_full_sweep_scheduler_on_random_dags(seed):
     # Liveness: every graph must drain, and every op must reach COMPLETED. A
     # scheduler that skipped a graph it should have revisited would park one
     # here forever -- in production a hung request rather than a wrong answer.
-    assert not new_sched._transfer_graphs, \
-        f"graphs left un-completed: {list(new_sched._transfer_graphs)}"
+    # _graph_bucket is the real scheduler's in-flight index (popped in lockstep
+    # with the fg/bg buckets on completion); the oracle keeps _transfer_graphs.
+    assert not new_sched._graph_bucket, \
+        f"graphs left un-completed: {list(new_sched._graph_bucket)}"
     assert not ref_sched._transfer_graphs, \
         f"reference left graphs un-completed: {list(ref_sched._transfer_graphs)}"
     assert not pending, "held-back graphs were never injected"
