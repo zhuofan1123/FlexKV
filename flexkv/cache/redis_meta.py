@@ -266,17 +266,24 @@ class RedisNodeInfo:
             # ignore exceptions in cleanup
             pass
     
-    def register_node(self) -> Optional[int]:
-        """Register a new node and get node_id, with TTL for automatic expiry on crash"""
+    def register_node(self, node_id: Optional[int] = None) -> Optional[int]:
+        """Register a new node and get node_id, with TTL for automatic expiry on crash
+
+        `node_id=None` allocates one from `global:node_id`. An explicit id (the
+        radixshmem cluster rank, which every process derives locally) is claimed
+        as-is and skips the same-IP stale sweep — co-located ranks share an IP,
+        so the sweep would delete a sibling rank's key.
+        """
         if not self._client:
             return None
         
         try:
-            # Clean up stale nodes from the same IP before registering
-            self._cleanup_stale_nodes_by_ip()
+            if node_id is None:
+                # Clean up stale nodes from the same IP before registering
+                self._cleanup_stale_nodes_by_ip()
 
-            # Atomically increment global:node_id to get new node_id
-            node_id = self._client.incr("global:node_id")
+                # Atomically increment global:node_id to get new node_id
+                node_id = self._client.incr("global:node_id")
             self._node_id = node_id
             
             # Store node information in node:node_id hash
@@ -604,8 +611,12 @@ class RedisMeta:
     def _client(self):
         return _redis.Redis(host=self.host, port=self.port, db=self.db, password=self.password, decode_responses=self.decode_responses)
 
-    def init_meta(self) -> Optional[int]:
+    def init_meta(self, node_id: Optional[int] = None) -> Optional[int]:
         """Initialize Redis metadata. This method is thread-safe and can only be called once per instance.
+        
+        Args:
+            node_id: claim this id (the radixshmem cluster rank) instead of
+                allocating one from `global:node_id`
         
         Returns:
             Optional[int]: The registered node ID, or None if initialization fails
@@ -626,14 +637,14 @@ class RedisMeta:
                     raise RuntimeError("Failed to connect to Redis via RedisNodeInfo")
                 
                 # register node
-                node_id = self.nodeinfo.register_node()
+                node_id = self.nodeinfo.register_node(node_id)
                 if node_id is None:
                     raise RuntimeError("Failed to register node via RedisNodeInfo")
                 
                 self._node_id = node_id
                 # initialization phase, scan active nodes first
                 self.nodeinfo.scan_active_nodes()
-                
+
                 # mark as initialized
                 self._initialized = True
                 

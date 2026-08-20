@@ -28,6 +28,10 @@ from flexkv.cache.hie_cache_engine import HierarchyLRCacheEngine
 from flexkv.cache.redis_meta import RedisMeta, dist_available
 
 from flexkv.cache.mempool import Mempool
+from flexkv.cache.radix_shmem_engine import (
+    ShmRadixMatch,
+    StagedRadixInsert,
+)
 from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
 from flexkv.cache.swa_cache_engine import SWAOpConstructor
 from flexkv.common.block import SequenceMeta
@@ -611,6 +615,82 @@ DEFAULT_CACHE_STRATEGY = CacheStrategy()
 
 CPUONLY_CACHE_STRATEGY = CacheStrategy(ignore_gpu=False, ignore_ssd=True, ignore_remote=True, ignore_gds=True)
 
+
+@dataclass(frozen=True)
+class _ShmGetSpan:
+    """Blocks ``[start, end)`` of a radixshmem GET window, and where to read them.
+
+    ``src_block_ids`` is already resolved: a local head and a peer tail count from
+    different origins inside their match, and rebasing happens once, here, at
+    construction. Everything downstream only ever talks in absolute blocks.
+
+    ``transfer_type`` is None for the local CPU head -- those blocks are already
+    in host memory, so they are read where they lie rather than copied anywhere.
+    """
+    tier: str  # metrics label for the tier that served the blocks
+    transfer_type: Optional[TransferType]
+    start: int
+    end: int
+    src_block_ids: np.ndarray
+    src_block_node_ids: Optional[np.ndarray] = None
+
+    def __len__(self) -> int:
+        return self.end - self.start
+
+    @property
+    def needs_staging(self) -> bool:
+        """True when these blocks have to be copied into local slots first."""
+        return self.transfer_type is not None
+
+
+def _shm_get_spans(cpu_match: ShmRadixMatch,
+                   ssd_match: ShmRadixMatch,
+                   lo: int,
+                   hi: int) -> List[_ShmGetSpan]:
+    """Cut the GET window ``[lo, hi)`` into one span per source, nearest first.
+
+        lo            cpu local     cpu matched   ssd local     ssd matched   hi
+        |  local CPU  |  peer CPU   |  local SSD  |  peer SSD   |   (miss)    |
+        | read where  |   PEERH2H   |   DISK2H    |  PEERSSD2H  |
+        | it lies     +------------- staged in fresh local slots -------------+
+        +------------------------------ one H2D ------------------------------+
+
+    A source can only ever EXTEND the coverage of the ones ahead of it, so the
+    layout is just a cursor walking from ``lo`` towards ``hi`` and it takes one
+    clamp and one test to place every boundary: ``min(limit, hi)`` trims a match
+    that overruns the window, and ``end > cursor`` is what makes a tier claim only
+    ground no nearer tier already covers -- a tier that matched LESS than an
+    earlier one reaches no further than the cursor and so contributes nothing.
+
+    Empty spans are dropped, so a purely local hit comes back as a single span and
+    no caller needs a per-tier special case. The last span's ``end`` is the end of
+    the whole hit, and the spans that need staging are always its tail -- which is
+    what lets one contiguous allocation back all of them and one H2D read the lot.
+    """
+    # (tier, transfer type, first block NOT covered, slots, peer node ids).
+    sources = (
+        ("cpu", None, cpu_match.num_local_blocks,
+         cpu_match.local_range, None),
+        ("cpu", TransferType.PEERH2H, cpu_match.num_matched_blocks,
+         cpu_match.peer_range, cpu_match.peer_node_ids),
+        ("ssd", TransferType.DISK2H, ssd_match.num_local_blocks,
+         ssd_match.local_range, None),
+        ("ssd", TransferType.PEERSSD2H, ssd_match.num_matched_blocks,
+         ssd_match.peer_range, ssd_match.peer_node_ids),
+    )
+    spans: List[_ShmGetSpan] = []
+    cursor = lo
+    for tier, transfer_type, limit, slots, node_ids in sources:
+        end = min(limit, hi)
+        if end > cursor:
+            spans.append(_ShmGetSpan(
+                tier, transfer_type, cursor, end,
+                src_block_ids=slots(cursor, end),
+                src_block_node_ids=None if node_ids is None else node_ids(cursor, end)))
+            cursor = end
+    return spans
+
+
 class GlobalCacheEngine:
     def __init__(self, cache_config: CacheConfig, model_config: ModelConfig, redis_meta: RedisMeta = None,
                  event_collector: Optional[KVEventCollector] = None):
@@ -663,12 +743,18 @@ class GlobalCacheEngine:
             )
 
         if cache_config.enable_cpu:
-            if cache_config.enable_p2p_cpu:
-                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta) #TODO
-            elif self.use_radix_shmem:
+            # radix_shmem owns the index outright — including the distributed
+            # (peer) case, where the shared radix tree replaces the Redis-backed
+            # HierarchyLRCacheEngine rather than layering on top of it. So it must
+            # be checked BEFORE enable_p2p_cpu, which both backends read as
+            # "peer reuse is on".
+            if self.use_radix_shmem:
                 self.cpu_cache_engine = self._build_radix_shmem_engine(
-                    DeviceType.CPU, cache_config.num_cpu_blocks, event_collector
+                    DeviceType.CPU, cache_config.num_cpu_blocks, event_collector,
+                    peer_enabled=cache_config.enable_p2p_cpu,
                 )
+            elif cache_config.enable_p2p_cpu:
+                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta) #TODO
             elif self.index_accel:
                 self.cpu_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.CPU,
@@ -699,12 +785,18 @@ class GlobalCacheEngine:
                 )
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
-            if cache_config.enable_p2p_ssd:
-                self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta) #TODO
-            elif self.use_radix_shmem:
+            # radix_shmem owns the index outright — including the distributed
+            # (peer) case, where the shared radix tree replaces the Redis-backed
+            # HierarchyLRCacheEngine rather than layering on top of it. So it must
+            # be checked BEFORE enable_p2p_ssd, which both backends read as
+            # "peer reuse is on".
+            if self.use_radix_shmem:
                 self.ssd_cache_engine = self._build_radix_shmem_engine(
-                    DeviceType.SSD, cache_config.num_ssd_blocks, event_collector
+                    DeviceType.SSD, cache_config.num_ssd_blocks, event_collector,
+                    peer_enabled=cache_config.enable_p2p_ssd,
                 )
+            elif cache_config.enable_p2p_ssd:
+                self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta) #TODO
             elif self.index_accel:
                 self.ssd_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.SSD,
@@ -790,7 +882,8 @@ class GlobalCacheEngine:
     def _build_radix_shmem_engine(self,
                                    device_type: DeviceType,
                                    num_blocks: int,
-                                   event_collector) -> "object":
+                                   event_collector,
+                                   peer_enabled: bool = False) -> "object":
         """Attach to a pre-created radixshmem region as a RadixClient.
 
         The shm region itself (RadixServer) is owned by the KVManager bootstrap
@@ -805,7 +898,14 @@ class GlobalCacheEngine:
             device_type=device_type,
             num_total_blocks=num_blocks,
             tokens_per_block=self.cache_config.tokens_per_block,
-            shm_name=shm_name_for(device_type, self._shm_radix_server_id),
+            shm_name=shm_name_for(
+                device_type,
+                self._shm_radix_server_id,
+                rank=getattr(GLOBAL_CONFIG_FROM_ENV, "radix_rank", 0),
+                world_size=getattr(
+                    GLOBAL_CONFIG_FROM_ENV, "radix_world_size", 1
+                ),
+            ),
             evict_ratio=self.evict_ratio,
             evict_start_threshold=self.evict_start_threshold,
             hit_reward_seconds=self.hit_reward_seconds,
@@ -813,6 +913,7 @@ class GlobalCacheEngine:
             event_collector=event_collector,
             metrics_collector=self._metrics_collector,
             protected_threshold=self.protected_threshold,
+            peer_enabled=peer_enabled,
         )
 
     def start(self) -> None:
@@ -883,7 +984,22 @@ class GlobalCacheEngine:
                                      tokens_per_block=self.cache_config.tokens_per_block,
                                      namespace=namespace)
 
-        if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
+        if self.use_radix_shmem:
+            # Dispatched ahead of the enable_remote branch, which KVManager
+            # already rules out for this backend: radixshmem needs the spliced
+            # local+peer match and the insert-after-transfer order, neither of
+            # which _get_impl_local can express.
+            plan = self._get_impl_radixshmem(
+                request_id,
+                sequence_meta,
+                block_start_idx,
+                block_end_idx,
+                gpu_block_ids,
+                temp_cache_strategy,
+                dp_client_id,
+                swa_aware=swa_aware,
+            )
+        elif not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
             # from this entrance, we will also handle the case of peer_cpu and peer_ssd
             plan = self._get_impl_local(
                 request_id,
@@ -1582,6 +1698,211 @@ class GlobalCacheEngine:
             on_complete=on_complete,
         )
 
+    def _assert_radixshmem_no_swa(self, phase: str) -> None:
+        """radixshmem has no node-mounted SWA slot, so SWA cannot be planned.
+
+        CacheEngineRadixShmem exposes no ``_alloc_swa_slot`` and its match never
+        fills ``last_swa_node``: a window written by PUT would be invisible to
+        every GET. Fail loudly instead of silently dropping the window.
+        """
+        if self.swa_op_constructor.enabled:
+            raise NotImplementedError(
+                f"{phase} on the radixshmem backend does not support SWA "
+                f"(CacheEngineRadixShmem mounts no SWA slot on a tree node)"
+            )
+
+    def _match_radixshmem(self,
+                          sequence_meta: SequenceMeta,
+                          temp_cache_strategy: CacheStrategy,
+                          is_get: bool) \
+                              -> Tuple[ShmRadixMatch, ShmRadixMatch]:
+        """CPU + SSD matches for the radixshmem planners.
+
+        Not ``match_local_accel``: that one returns ``MatchResultAccel``, whose
+        single ``matched_pos`` cannot carry a local-head/peer-tail splice, and it
+        picks local-vs-cluster off ``enable_p2p_*``. Here the choice is structural
+        — a GET always asks the cluster (``match`` collapses to a local walk by
+        itself when the region has no peers), and a PUT is local-only because
+        ``transfer_engine`` routes no write into a peer's slots. ``is_get`` IS
+        ``with_peer``, which is why it is phrased from the GET side.
+
+        A tier that is absent or excluded by the strategy yields an empty match,
+        so callers can read the pair unconditionally.
+        """
+        cpu_match = ShmRadixMatch()
+        ssd_match = ShmRadixMatch()
+        if self.cpu_cache_engine is not None:
+            cpu_match = self.cpu_cache_engine.match(sequence_meta, with_peer=is_get)
+        if self.ssd_cache_engine is not None and not temp_cache_strategy.ignore_ssd:
+            ssd_match = self.ssd_cache_engine.match(sequence_meta, with_peer=is_get)
+        return cpu_match, ssd_match
+
+    def _get_impl_radixshmem(self,
+                             request_id: int,
+                             sequence_meta: SequenceMeta,
+                             block_mask_start: int,
+                             block_mask_end: int,
+                             gpu_block_ids: np.ndarray,
+                             temp_cache_strategy: CacheStrategy,
+                             dp_client_id: int,
+                             swa_aware: bool = False) \
+                                 -> GetTransferPlan:
+        """GET planner for the radixshmem CPU+SSD tiers.
+
+        Two properties of the shmradix API make this a separate planner rather
+        than a branch inside ``_get_impl_local``:
+
+        * A match is SPLICED, not "local OR peer". ``query()`` walks the local
+          tree and continues onto one peer's tree, and ``ShmRadixMatch`` keeps
+          both halves. So the local head can go straight to GPU and only the peer
+          tail needs host staging, where ``_get_impl_local`` pushes the entire CPU
+          fragment through PEERH2H the moment a peer wins.
+        * Slots join the tree only once they hold data, so the build-time insert
+          ``_get_impl_local`` does (ready bit off, flipped on completion) has no
+          equivalent here. This planner does not insert at all -- a GET promotes
+          nothing -- which leaves the slots reachable by nobody, so they have to
+          be handed back explicitly on every exit.
+
+        ``_shm_get_spans`` owns the whole block-range layout, so what is left here
+        is one allocation, one op per span, and the cleanups. Every range below is
+        an absolute block index.
+        """
+        nvtx_range = nvtx.start_range(
+            message=f"CacheEngine.get_impl_radixshmem[{request_id}]", color="cyan")
+        enable_gpu = not temp_cache_strategy.ignore_gpu
+        assert self.cache_config.enable_cpu
+        assert self.cpu_cache_engine is not None
+        self._assert_radixshmem_no_swa("GET")
+
+        cpu_match, ssd_match = self._match_radixshmem(
+            sequence_meta, temp_cache_strategy, is_get=True)
+
+        def _release_match() -> GetTransferPlan:
+            # Nothing will consume the matched prefix; drop the query's ref now.
+            cpu_match.release()
+            ssd_match.release()
+            if self._metrics_collector is not None and block_mask_end > block_mask_start:
+                self._metrics_collector.record_cache_miss(
+                    block_mask_end - block_mask_start)
+            nvtx.end_range(nvtx_range)
+            return self._empty_get_return(request_id)
+
+        spans = _shm_get_spans(cpu_match, ssd_match,
+                               block_mask_start, block_mask_end)
+        num_staged = sum(len(span) for span in spans if span.needs_staging)
+
+        staging = np.empty(0, dtype=np.int64)
+        if num_staged > 0:
+            staging = self.cpu_cache_engine.take(num_required_blocks=num_staged,
+                                                 strict=False)
+            if len(staging) < num_staged:
+                # Out of staging room. The local CPU head needs no staging at all,
+                # so degrade to serving just that instead of dropping the whole
+                # request. Dropping the staged spans re-derives every boundary.
+                self.cpu_cache_engine.recycle(staging)
+                if self._metrics_collector is not None:
+                    self._metrics_collector.record_allocation_failure("local")
+                spans = [span for span in spans if not span.needs_staging]
+                served = spans[-1].end if spans else block_mask_start
+                flexkv_logger.warning(
+                    f"radixshmem GET {request_id}: only {len(staging)}/{num_staged} "
+                    f"staging blocks available; serving the local CPU prefix "
+                    f"[{block_mask_start}, {served}) only"
+                )
+                staging = np.empty(0, dtype=np.int64)
+
+        if not spans:
+            return _release_match()
+        end = spans[-1].end
+
+        if self._metrics_collector is not None:
+            cpu_blocks = sum(len(span) for span in spans if span.tier == "cpu")
+            self._metrics_collector.record_cache_hit("cpu", cpu_blocks)
+            self._metrics_collector.record_cache_hit(
+                "ssd", end - block_mask_start - cpu_blocks)
+            if block_mask_end > end:
+                self._metrics_collector.record_cache_miss(block_mask_end - end)
+
+        transfer_graph = TransferOpGraph()
+        staging_ops_ids: List[int] = []
+        h2d_src_block_ids: List[np.ndarray] = []
+        staged = 0
+        for span in spans:
+            if not span.needs_staging:
+                # Already in host memory, so H2D reads it straight from the match.
+                h2d_src_block_ids.append(span.src_block_ids)
+                continue
+            # The staged spans are the tail of the window and come in order, so a
+            # running offset walks down the single allocation backing them all.
+            dst_block_ids = staging[staged:staged + len(span)]
+            staged += len(span)
+            h2d_src_block_ids.append(dst_block_ids)
+            op = TransferOp(
+                graph_id=transfer_graph.graph_id,
+                transfer_type=span.transfer_type,
+                src_block_ids=span.src_block_ids,
+                dst_block_ids=dst_block_ids,
+                src_block_node_ids=span.src_block_node_ids,
+                dp_client_id=dp_client_id,
+            )
+            transfer_graph.add_transfer_op(op)
+            staging_ops_ids.append(op.op_id)
+
+        if enable_gpu:
+            # One H2D for the whole hit: the staging is contiguous and sits right
+            # behind the local head, so the sources concatenate in span order.
+            op_h2d = TransferOp(
+                graph_id=transfer_graph.graph_id,
+                transfer_type=TransferType.H2D,
+                src_block_ids=np.concatenate(h2d_src_block_ids),
+                dst_block_ids=gpu_block_ids[:end - block_mask_start],
+                dp_client_id=dp_client_id,
+            )
+            transfer_graph.add_transfer_op(op_h2d)
+            for op_id in staging_ops_ids:
+                transfer_graph.add_dependency(op_h2d.op_id, op_id)
+            finished_ops_ids = [op_h2d.op_id]
+        else:
+            # No H2D to hang the contract on (prefetch-style GET): the staging
+            # ops are the terminals.
+            finished_ops_ids = list(staging_ops_ids)
+
+        staging_returned = False
+
+        def _return_staging() -> None:
+            # No promotion: what a GET reads off a peer (or off local disk) is not
+            # published into the local CPU tree. Nothing is lost by that -- the
+            # request's own PUT stores the sequence when it finishes, which is what
+            # makes the prefix locally reusable. So the staging is scratch for the
+            # H2D above, which has read it by the time the graph completes.
+            nonlocal staging_returned
+            if staging_returned:
+                return
+            staging_returned = True
+            assert self.cpu_cache_engine is not None
+            self.cpu_cache_engine.recycle(staging)
+
+        # Each cleanup has to run whether the graph completes or is cancelled: a
+        # cancelled graph never reaches on_complete, and both resources are
+        # invisible to reclamation until released -- a slot outside the tree to
+        # eviction, and the matched prefix stays pinned for the life of the
+        # region. Both are idempotent, so arming the two paths costs nothing.
+        cleanups: List[Callable[[], None]] = []
+        if len(staging) > 0:
+            cleanups.append(_return_staging)
+        cleanups += [cpu_match.release, ssd_match.release]
+        for cleanup in cleanups:
+            transfer_graph.add_cancel_cleanup(cleanup)
+
+        nvtx.end_range(nvtx_range)
+        return GetTransferPlan(
+            transfer_graph=transfer_graph,
+            finished_ops_ids=finished_ops_ids,
+            op_callback_dict={},
+            num_gpu_blocks_to_transfer=(end - block_mask_start) if enable_gpu else 0,
+            on_complete=cleanups,
+        )
+
     def put(self,
             request_id: int,
             token_ids: np.ndarray,
@@ -1609,7 +1930,19 @@ class GlobalCacheEngine:
                                      namespace=namespace)
 
         assert not temp_cache_strategy.ignore_gpu
-        if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
+        if self.use_radix_shmem:
+            # See the matching branch in get(): insert-after-transfer, and
+            # enable_remote is already excluded for this backend.
+            plan = self._put_impl_radixshmem(
+                request_id,
+                sequence_meta,
+                block_start_idx,
+                block_end_idx,
+                gpu_block_ids,
+                temp_cache_strategy,
+                dp_client_id,
+            )
+        elif not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
             plan = self._put_impl_local(
                 request_id,
                 sequence_meta,
@@ -2194,6 +2527,171 @@ class GlobalCacheEngine:
             op_callback_dict=op_callback_dict,
             num_gpu_blocks_to_transfer=len(fragment12_gpu_blocks),
             skipped_gpu_blocks=skipped_gpu_blocks,
+            on_complete=on_complete,
+        )
+
+    def _put_impl_radixshmem(self,
+            request_id: int,
+            sequence_meta: SequenceMeta,
+            block_mask_start: int,
+            block_mask_end: int,
+            gpu_block_ids: np.ndarray,
+            temp_cache_strategy: CacheStrategy,
+            dp_client_id: int) \
+                -> PutTransferPlan:
+        """PUT planner for the radixshmem CPU+SSD tiers.
+
+        Local-only, and not by choice: ``TransferType`` has H2PEERH/H2PEERSSD but
+        ``transfer_engine`` routes neither, so there is no way to write into a
+        peer's slots. A PUT match is therefore ``with_peer=False`` -- never spliced --
+        and the only thing that differs from ``_put_impl_local`` is WHEN the tree
+        learns about the slots: radixshmem accepts them only once they hold data,
+        so both inserts move into the graph-completion callback.
+
+        Block index:  0        cpu_tot        ssd_tot        block_mask_end
+            GPU     : (skipped) |          fragment          |
+                                     |  D2H into new slots
+            CPU     : (cached) -+                            |
+                                              |  H2DISK
+            SSD     : (cached) ---------------+              |
+
+        The two tiers have independent matched prefixes, so their new spans start
+        at different blocks and each gets its own insert.
+        """
+        enable_gpu = not temp_cache_strategy.ignore_gpu
+        enable_ssd = self.cache_config.enable_ssd and not temp_cache_strategy.ignore_ssd
+        assert enable_gpu
+        assert self.cache_config.enable_cpu
+        assert self.cpu_cache_engine is not None
+        self._assert_radixshmem_no_swa("PUT")
+
+        cpu_match, ssd_match = self._match_radixshmem(
+            sequence_meta, temp_cache_strategy, is_get=False)
+
+        def _release_match() -> PutTransferPlan:
+            # Nothing will consume the matched prefix; drop the query's ref now.
+            cpu_match.release()
+            ssd_match.release()
+            return self._empty_put_return(request_id)
+
+        # How much of the window each tier already holds. ``is_get=False`` means no
+        # peer tail, so the whole match is local, and intersecting it with the
+        # window is what bounds it -- the same thing ``_put_impl_local`` gets from
+        # slicing its matched blocks. A match stopping short of ``block_mask_start``
+        # counts for nothing and one running past ``block_mask_end`` is trimmed, so
+        # there is no boundary arithmetic to do here.
+        num_skipped = len(cpu_match.local_range(block_mask_start, block_mask_end))
+        # Nothing to spill without SSD: treat the tier as covering the window already.
+        num_ssd_cached = ((block_mask_end - block_mask_start) if not enable_ssd
+                          else len(ssd_match.local_range(block_mask_start, block_mask_end)))
+
+        # First window block each tier does not already hold.
+        cpu_tot = block_mask_start + num_skipped
+        ssd_tot = block_mask_start + num_ssd_cached
+        num_cpu_new = block_mask_end - cpu_tot
+        num_ssd_new = block_mask_end - ssd_tot
+        # Same policy as _put_impl_local: a fully-matched CPU prefix ends the PUT
+        # even when SSD is still short of it.
+        if num_cpu_new == 0:
+            return _release_match()
+
+        cpu_new = self.cpu_cache_engine.take(num_required_blocks=num_cpu_new,
+                                             strict=False)
+        if num_ssd_new > 0:
+            assert self.ssd_cache_engine is not None
+            ssd_new = self.ssd_cache_engine.take(num_required_blocks=num_ssd_new,
+                                                 strict=False)
+        else:
+            ssd_new = np.array([], dtype=np.int64)
+
+        if len(cpu_new) < num_cpu_new or len(ssd_new) < num_ssd_new:
+            flexkv_logger.warning(
+                f"radixshmem PUT {request_id} skipped: CPU "
+                f"{len(cpu_new)}/{num_cpu_new}, SSD {len(ssd_new)}/{num_ssd_new}"
+            )
+            self.cpu_cache_engine.recycle(cpu_new)
+            if num_ssd_new > 0:
+                self.ssd_cache_engine.recycle(ssd_new)
+            if self._metrics_collector is not None:
+                self._metrics_collector.record_allocation_failure("local")
+            return _release_match()
+
+        transfer_graph = TransferOpGraph()
+        finished_ops_ids: List[int] = []
+
+        fragment_gpu_blocks = gpu_block_ids[num_skipped:]
+        op_d2h = TransferOp(
+            graph_id=transfer_graph.graph_id,
+            transfer_type=TransferType.D2H,
+            src_block_ids=fragment_gpu_blocks,
+            dst_block_ids=cpu_new,
+            dp_client_id=dp_client_id,
+        )
+        transfer_graph.add_transfer_op(op_d2h)
+        # Task end is D2H alone, as in _put_impl_local: the request is free once
+        # its GPU blocks are drained, the SSD spill finishes behind it.
+        finished_ops_ids.append(op_d2h.op_id)
+
+        if len(ssd_new) > 0:
+            # H2DISK covers absolute blocks [ssd_tot, block_mask_end). From cpu_tot on that is
+            # the staging just taken; anything before it is already in CPU cache,
+            # so it is read from the matched slots.
+            if ssd_tot >= cpu_tot:
+                h2disk_src = cpu_new[ssd_tot - cpu_tot:]
+            else:
+                h2disk_src = np.concatenate(
+                    [cpu_match.local_range(ssd_tot, cpu_tot), cpu_new])
+            assert len(h2disk_src) == len(ssd_new)
+            op_h2disk = TransferOp(
+                graph_id=transfer_graph.graph_id,
+                transfer_type=TransferType.H2DISK,
+                src_block_ids=h2disk_src,
+                dst_block_ids=ssd_new,
+                dp_client_id=dp_client_id,
+            )
+            transfer_graph.add_transfer_op(op_h2disk)
+            transfer_graph.add_dependency(op_h2disk.op_id, op_d2h.op_id)
+
+        # Both inserts run at graph completion rather than on their own op's
+        # callback: radixshmem admits only blocks that already hold data, and
+        # completion is the first point past every op that writes them -- D2H
+        # filling the CPU staging, and H2DISK reading it back out.
+        on_complete: List[Callable[[], None]] = []
+
+        def _arm(engine, slots: np.ndarray,
+                 hold: Callable[[], None], label: str) -> None:
+            # ``hold`` is the ref this tier's insert needs: its span starts where
+            # that match ran out, and radixshmem rejects a span whose start the
+            # local tree no longer reaches. Handing it to the staged insert is
+            # what keeps it alive for exactly that long -- both exits drop it.
+            staged = StagedRadixInsert(engine=engine,
+                                        sequence_meta=sequence_meta,
+                                        slots=slots,
+                                        path_end=block_mask_end,
+                                        label=label,
+                                        holds=[hold])
+            on_complete.append(staged.publish)
+            # on_complete never runs for a cancelled graph, and the slots plus the
+            # locked prefix would stay held for the life of the region. Both exits
+            # are idempotent, so arming this as well as the publish is fine.
+            transfer_graph.add_cancel_cleanup(staged.abort)
+
+        _arm(self.cpu_cache_engine, cpu_new,
+             cpu_match.release, f"PUT {request_id} CPU")
+        if len(ssd_new) > 0:
+            _arm(self.ssd_cache_engine, ssd_new,
+                 ssd_match.release, f"PUT {request_id} SSD")
+        else:
+            # No SSD span to insert, so nothing constrains when this ref goes.
+            on_complete.append(ssd_match.release)
+            transfer_graph.add_cancel_cleanup(ssd_match.release)
+
+        return PutTransferPlan(
+            transfer_graph=transfer_graph,
+            finished_ops_ids=finished_ops_ids,
+            op_callback_dict={},
+            num_gpu_blocks_to_transfer=len(fragment_gpu_blocks),
+            skipped_gpu_blocks=num_skipped,
             on_complete=on_complete,
         )
 

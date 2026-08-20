@@ -77,7 +77,8 @@ class PrefetchController:
       - channel_id       : -1 (default) auto-resolves to the first reserved
                            external channel (= total_clients, read from the TE
                            ctrl block); pass an explicit id to override.
-      - layer count      : op uses layer_granularity=-1; the TE fills its own.
+      - layer count      : not carried on the op at all; the TE derives it from
+                           the layout registered by the serving process.
 
     A flock on the chosen channel is held as insurance: if a second external
     controller targets the same channel it fails loudly instead of silently
@@ -88,12 +89,17 @@ class PrefetchController:
         pc.start()                         # ready + starts background drain
         tid = pc.prefetch(token_ids)       # fire-and-forget from any thread
         ...                                # optionally check pc.is_done(tid)
-        pc.shutdown()                      # stops drain thread, releases lock
+        pc.shutdown()                      # drains, stops drain thread, unlocks
 
     start() launches a daemon thread that drains completions every ~1 ms and
-    fires each task's finalize (set_ready + dec_ref). The caller's thread only
+    publishes each landed transfer into the CPU tree. The caller's thread only
     calls prefetch(); it never polls. Thread-safe: prefetch() may be called
     concurrently with the drain thread.
+
+    Draining is load-bearing, not bookkeeping: radixshmem only accepts blocks
+    that already hold data, so the insert runs from the completion callback. A
+    task that is never drained leaves its CPU slots outside the tree, where
+    nothing can find them and nothing can evict them.
     """
 
     def __init__(self,
@@ -259,7 +265,7 @@ class PrefetchController:
     def is_ready(self) -> bool:
         return self.handle.is_ready()
 
-    def shutdown(self) -> None:
+    def shutdown(self, drain_timeout_s: float = 2.0) -> None:
         # Stop the drain thread first so nothing touches the channel/engines
         # after we close them.
         self._stop.set()
@@ -267,6 +273,7 @@ class PrefetchController:
         if th is not None and th.is_alive():
             th.join(timeout=2.0)
         self._poll_thread = None
+        self._drain_inflight(drain_timeout_s)
         # Close only our channel. The TE keeps running for internal FlexKV, and
         # the radix regions are owned by the FlexKV bootstrap process — we must
         # NOT unlink shm or tear them down here.
@@ -282,6 +289,33 @@ class PrefetchController:
             with contextlib.suppress(Exception):
                 self._ctrl.close()
             self._ctrl = None
+
+    def _drain_inflight(self, timeout_s: float) -> None:
+        """Give already-submitted graphs a last chance to publish before we go.
+
+        A task whose completion we never drain leaves its staged CPU slots
+        attached to nothing: unreachable by any query and invisible to eviction,
+        so they are lost until the region is recreated. Aborting them instead is
+        not an option — the TE may still be writing into them — so the choice is
+        wait, then say what was left behind.
+        """
+        deadline = time.monotonic() + max(timeout_s, 0.0)
+        while True:
+            with self._state_lock:
+                if not self._pending:
+                    return
+            if time.monotonic() >= deadline:
+                break
+            with contextlib.suppress(Exception):
+                self.poll(timeout=0.01)
+        with self._state_lock:
+            stranded = len(self._pending)
+            blocks = sum(s.num_blocks for s in self._pending.values())
+        flexkv_logger.warning(
+            f"PrefetchController shutting down with {stranded} prefetch "
+            f"task(s) still in flight; {blocks} staged CPU block(s) stay "
+            f"claimed in region {self.server_id} (a transfer may still be "
+            f"writing into them, so they cannot be recycled here)")
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
@@ -300,11 +334,14 @@ class PrefetchController:
     def prefetch(self,
                  token_ids: np.ndarray,
                  namespace: Optional[List[str]] = None) -> int:
-        """Warm the KV for `token_ids` from SSD/Remote into CPU (ready state).
+        """Warm the KV for `token_ids` from the local SSD tier into CPU.
+
+        The warmed blocks become visible to every attached process (and, on a
+        clustered region, to peers) when the drain thread publishes them.
 
         Returns the task id. If nothing needs to be transferred (full CPU hit or
         no matched blocks to move), the task completes immediately and its id is
-        still returned (wait() returns instantly).
+        still returned (is_done() is instantly True).
         """
         if not self._started:
             raise RuntimeError("PrefetchController.start() must be called first")
@@ -345,6 +382,10 @@ class PrefetchController:
                 self.submitted_count += 1
                 self.inflight_requests += 1
                 self.inflight_blocks += num_blocks
+                # A raise here means the submit ring is misconfigured or wedged
+                # (the only two paths in `submit_send`), so the controller is
+                # done for anyway; let it propagate and leave the staged slots
+                # be rather than carry a cleanup path for it.
                 self.handle.submit(graph)
 
         return task_id
@@ -352,14 +393,15 @@ class PrefetchController:
     def _build_prefetch_graph(self, task_id, token_ids, namespace):
         """Hand-build the SSD->CPU (DISK2H) graph.
 
-        Mirrors the collapsed `_get_impl_local` slice for
-        ignore_gpu+ignore_gds+no-p2p: a single DISK2H op moving the blocks that
-        are ready in SSD but not yet in CPU. Returns (graph, callback,
-        task_end_op_id). callback fires the insert finalize (set_ready+dec_ref),
-        releases the CPU node lock and the match pre-locks, and recycles unused
-        slots — it MUST run on completion (via poll/wait) or refs leak and the
-        shared mempool starves.
+        Mirrors the collapsed `_get_impl_radixshmem` slice for ignore_gpu: a
+        single DISK2H op moving the blocks the local SSD tree holds but the
+        local CPU tree does not. Returns (graph, callback,
+        task_end_op_id, num_blocks). `callback` publishes the staged slots into
+        the CPU tree and drops the match refs — it MUST run on completion (via
+        poll/wait) or the staged slots stay outside the tree and the shared
+        mempool starves.
         """
+        from flexkv.cache.radix_shmem_engine import ShmRadixMatch, StagedRadixInsert
         from flexkv.common.block import SequenceMeta
 
         seq = SequenceMeta(token_ids=token_ids,
@@ -368,90 +410,79 @@ class PrefetchController:
 
         empty_graph = TransferOpGraph.create_empty_graph()
 
-        cpu_m = self.cpu_engine.match(seq)
-        ssd_m = self.ssd_engine.match(seq) if self.ssd_engine is not None else None
+        # Local-only on both tiers. A peer tail is useless here: this controller
+        # emits DISK2H, which reads the local SSD region, so a spliced match
+        # would hand it slot ids out of somebody else's mempool. No SSD tier
+        # stands in as an empty match, like `_match_radixshmem` does, so
+        # everything below reads the pair without re-testing the tier.
+        cpu_m = self.cpu_engine.match(seq, with_peer=False)
+        ssd_m = (self.ssd_engine.match(seq, with_peer=False)
+                 if self.ssd_engine is not None else ShmRadixMatch())
 
-        cpu_ready = cpu_m.num_ready_matched_blocks
-        ssd_ready = ssd_m.num_ready_matched_blocks if ssd_m is not None else 0
+        # match(lock=True) inc_ref'd each matched prefix; release() is the only
+        # thing that drops those refs, and it must run on every path. It is
+        # idempotent, so a path that runs both cleanups is fine.
+        def drop_match_refs():
+            for m in (cpu_m, ssd_m):
+                try:
+                    m.release()
+                except Exception as e:  # keep releasing the rest
+                    flexkv_logger.error(
+                        f"prefetch task {task_id}: match release failed: {e}")
 
-        # Blocks ready in SSD but not yet in CPU: the set we can warm.
-        n = ssd_ready - cpu_ready
+        # Local-only matches, so num_local_blocks is the whole hit.
+        cpu_hit = cpu_m.num_local_blocks
+        ssd_hit = ssd_m.num_local_blocks
 
-        def release_prelocks():
-            # match(lock=True) atomically inc_ref'd the ready prefix; release
-            # symmetrically on every path so we never leak a match ref.
-            pre = getattr(cpu_m, "pre_locked_node", None)
-            if pre is not None:
-                self.cpu_engine.unlock(pre)
-                cpu_m.pre_locked_node = None
-            if ssd_m is not None:
-                pre_s = getattr(ssd_m, "pre_locked_node", None)
-                if pre_s is not None:
-                    self.ssd_engine.unlock(pre_s)
-                    ssd_m.pre_locked_node = None
+        # Blocks the SSD tier holds beyond what CPU already has: what we can warm.
+        n = ssd_hit - cpu_hit
 
         if n <= 0:
-            # Nothing to warm (already in CPU, or SSD doesn't have more). Still
-            # must drop the match pre-locks.
-            release_prelocks()
+            # Nothing to warm (already in CPU, or SSD doesn't have more).
+            drop_match_refs()
             return empty_graph, None, -1, 0
 
-        ssd_slots = np.asarray(ssd_m.physical_blocks[:ssd_ready], dtype=np.int64)
         # The tail `n` blocks are the ones missing from CPU (CPU has the first
-        # cpu_ready of the shared prefix).
-        src_ssd = ssd_slots[cpu_ready:cpu_ready + n]
+        # cpu_hit of the shared prefix).
+        src_ssd = np.asarray(ssd_m.local_range(cpu_hit, ssd_hit), dtype=np.int64)
 
-        cpu_slots = self.cpu_engine.take(
-            num_required_blocks=n,
-            protected_node=cpu_m.last_node,
-            strict=False,
-        )
+        cpu_slots = self.cpu_engine.take(num_required_blocks=n, strict=False)
         if len(cpu_slots) < n:
             # Not enough CPU space even after LRU eviction — skip (do not crash).
             self.cpu_engine.recycle(cpu_slots)
-            release_prelocks()
+            drop_match_refs()
             return empty_graph, None, -1, 0
 
+        cpu_slots = np.asarray(cpu_slots, dtype=np.int64)
         graph = TransferOpGraph()
         op = TransferOp(
             graph_id=graph.graph_id,
             transfer_type=TransferType.DISK2H,
             src_block_ids=np.asarray(src_ssd, dtype=np.int64),
-            dst_block_ids=np.asarray(cpu_slots, dtype=np.int64),
-            layer_id=0,
-            # -1 => TE fills its own registered layer count (from vLLM's GPU
-            # layout); the controller needn't know num_layers.
-            layer_granularity=-1,
+            dst_block_ids=cpu_slots,
         )
         graph.add_transfer_op(op)
 
-        # Insert the freshly-allocated CPU slots as an UNREADY suffix so a
-        # concurrent reader won't treat them as valid before the transfer lands.
-        # insert() auto-inc_refs (locks) the node and arms a finalize
-        # (set_ready + dec_ref). We additionally lock_node for the hand-off,
-        # mirroring _get_impl_local.
-        cpu_node, cpu_unused = self.cpu_engine.insert(
-            seq, np.asarray(cpu_slots, dtype=np.int64),
-            num_insert_blocks=ssd_ready, is_ready=False, match_result=cpu_m)
-        if cpu_node is not None:
-            self.cpu_engine.lock_node(cpu_node)
+        # radixshmem publishes only complete blocks, so the CPU slots stay out of
+        # the tree until the DISK2H lands — nothing else can see them, and
+        # nothing else can free them either, hence the staged handle.
+        # publish() inserts at start = ssd_hit - n = cpu_hit, which the local tree
+        # must still reach; cpu_m's ref is what keeps it there, so the refs go to
+        # the staged insert -- both its exits drop them, after the insert.
+        staged = StagedRadixInsert(
+            engine=self.cpu_engine,
+            sequence_meta=seq,
+            slots=cpu_slots,
+            path_end=ssd_hit,
+            label=f"prefetch task {task_id} CPU",
+            holds=[drop_match_refs],
+        )
 
-        # Take over protection, then drop the match pre-locks (as _get_impl_local
-        # does): lock_node above already took an independent ref for matched
-        # nodes; inserted nodes carry their own armed finalize.
-        release_prelocks()
+        # A transfer that never completes would otherwise strand the slots
+        # outside the tree for the life of the region.
+        graph.add_cancel_cleanup(staged.abort)
 
-        def callback():
-            # cpu_node here is always an *inserted* node (insert(is_ready=False)),
-            # so it carries shmradix's armed finalize (= set_ready + dec_ref).
-            # unlock() fires that finalize in one atomic shot — no separate
-            # set_ready needed (set_ready() is a no-op on inserted nodes anyway).
-            if cpu_node is not None:
-                self.cpu_engine.unlock(cpu_node)
-            if cpu_unused is not None and getattr(cpu_unused, "size", 0) > 0:
-                self.cpu_engine.recycle(cpu_unused)
-
-        return graph, callback, op.op_id, n
+        return graph, staged.publish, op.op_id, n
 
     # ---- completion draining ----
 
@@ -483,9 +514,9 @@ class PrefetchController:
         """Drain completed ops from our channel and finalize done graphs.
 
         Normally driven by the internal background thread (~1 ms); callers do
-        not need to call this. Firing a task's finalize (set_ready + dec_ref)
+        not need to call this. Publishing a landed transfer into the CPU tree
         happens here. `_poll_lock` keeps the result ring single-consumer; the
-        finalize itself runs under `_state_lock`.
+        insert itself runs under `_state_lock`.
         """
         with self._poll_lock:
             completed = [cop for cop in self.handle.wait(timeout)

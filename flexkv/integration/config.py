@@ -21,6 +21,56 @@ def _dsv4_swa_transfer_enabled_from_env() -> bool:
     return bool(int(os.getenv("FLEXKV_ENABLE_SWA_TRANSFER", "1")))
 
 
+def _resolve_vllm_dp_rank(parallel_config: object) -> int:
+    """This engine's DP rank, as FlexKV needs it rather than as vLLM reports it.
+
+    For non-MoE models vLLM runs each DP rank as a fully independent engine and
+    resets that child's ``data_parallel_rank`` to 0, keeping the real rank only
+    in ``data_parallel_index`` (vllm/v1/engine/core.py, "Non-MoE DP ranks are
+    completely independent, so treat like DP=1"). FlexKV cannot follow suit: its
+    per-engine identity ``dp_client_id = instance_id * dp_size + dp_rank`` is
+    what keeps the DP engines of one node apart, so a collapsed rank makes all
+    of them claim shm-radix bootstrap ownership, transfer-engine channel 0, the
+    same gpu_register endpoint, and overlapping graph/op id ranges.
+
+    ``FLEXKV_DP_RANK`` overrides both, for launchers that pin the rank
+    themselves.
+    """
+    env_rank = os.environ.get("FLEXKV_DP_RANK")
+    if env_rank:
+        return int(env_rank)
+    dp_index = getattr(parallel_config, "data_parallel_index", None)
+    if dp_index is not None:
+        return int(dp_index)
+    return int(getattr(parallel_config, "data_parallel_rank", 0))
+
+
+def _resolve_vllm_dp_size(parallel_config: object) -> int:
+    """The node's DP width. Needs an env var: vLLM erases it in the children.
+
+    The same non-MoE branch that collapses the rank also sets the child's
+    ``data_parallel_size`` to 1, and unlike the rank it leaves no surviving copy
+    anywhere in ``parallel_config``. FlexKV derives ``total_clients`` (the shared
+    transfer engine's channel count and its expected GPU-registration count) and
+    ``total_gpus`` (which gates clearing ``CUDA_VISIBLE_DEVICES`` in the TE
+    subprocess so it can open every DP rank's IPC handles) from it, so a stale 1
+    leaves the TE waiting for registrations that already arrived under a
+    duplicate device id.
+
+    Only ever raises the value, so single-engine and MoE setups -- where vLLM's
+    own number is already right -- are untouched.
+    """
+    dp_size = int(getattr(parallel_config, "data_parallel_size", 1))
+    env_size = os.environ.get("FLEXKV_DP_SIZE")
+    if env_size and int(env_size) > dp_size:
+        logger.info(
+            f"[FlexKV vllm] dp_size {dp_size} -> {env_size} from FLEXKV_DP_SIZE "
+            f"(vLLM resets data_parallel_size to 1 in non-MoE DP children)"
+        )
+        return int(env_size)
+    return dp_size
+
+
 def _is_nvfp4_dtype_str(dtype_str: Optional[str]) -> bool:
     """Return True if *dtype_str* selects the NVFP4 packed KV cache layout."""
     return isinstance(dtype_str, str) and dtype_str.lower() in ("nvfp4", "fp4", "e2m1")
@@ -205,7 +255,7 @@ class FlexKVConfig:
         parallel_config = vllm_config.parallel_config
         tp_rank = int(getattr(parallel_config, 'tensor_parallel_rank', 0))
         pp_rank = int(getattr(parallel_config, 'pipeline_parallel_rank', 0))
-        dp_rank = int(getattr(parallel_config, 'data_parallel_rank', 0))
+        dp_rank = _resolve_vllm_dp_rank(parallel_config)
         node_rank = int(getattr(parallel_config, 'node_rank', 0))
         self.cache_config.tokens_per_block = vllm_config.cache_config.block_size
 
@@ -245,7 +295,7 @@ class FlexKVConfig:
                 "config, use fp8/fp8_ds_mla for MLA instead."
             )
         self.model_config.tp_size = int(parallel_config.tensor_parallel_size)
-        self.model_config.dp_size = int(parallel_config.data_parallel_size)
+        self.model_config.dp_size = _resolve_vllm_dp_size(parallel_config)
         self.model_config.pp_size = int(parallel_config.pipeline_parallel_size)
         # vLLM CP (context parallel) support: read cp_size from parallel_config.
         # Falls back to 1 if the attribute is not present (older vLLM versions).

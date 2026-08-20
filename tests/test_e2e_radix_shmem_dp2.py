@@ -135,8 +135,7 @@ def _dp_proc(dp_client_id, dp_size, server_id, write_barrier, result_q):
             tok, slot, blk = _build_request(
                 rng_seed=1000 * dp_client_id + i,
                 start_block=i * BLOCK_PER_REQUEST, n_blocks=BLOCK_PER_REQUEST)
-            tid = kvm.put_async(token_ids=tok, slot_mapping=slot,
-                                dp_id=dp_client_id)
+            tid = kvm.put_async(token_ids=tok, slot_mapping=slot)
             own.append(tid)
         st = kvm.wait(own, timeout=60, completely=True)
         own_ok = sum(1 for s in st.values()
@@ -149,7 +148,7 @@ def _dp_proc(dp_client_id, dp_size, server_id, write_barrier, result_q):
             tok, slot, blk = _build_request(
                 rng_seed=SHARED_SEED, start_block=128,
                 n_blocks=BLOCK_PER_REQUEST)
-            tid = kvm.put_async(token_ids=tok, slot_mapping=slot, dp_id=0)
+            tid = kvm.put_async(token_ids=tok, slot_mapping=slot)
             s = kvm.wait([tid], timeout=60, completely=True)
             shared_ok = all(v.status == KVResponseStatus.SUCCESS
                             for v in s.values())
@@ -163,7 +162,7 @@ def _dp_proc(dp_client_id, dp_size, server_id, write_barrier, result_q):
                 n_blocks=BLOCK_PER_REQUEST)
             # poll get_match a few times: index visibility is async post-store.
             for _ in range(50):
-                _tid, mask = kvm.get_match(token_ids=tok, dp_id=1)
+                _tid, mask = kvm.get_match(token_ids=tok)
                 shared_hit_blocks = int(np.count_nonzero(mask)) // TOKENS_PER_BLOCK \
                     if mask is not None else 0
                 if shared_hit_blocks > 0:

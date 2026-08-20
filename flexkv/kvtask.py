@@ -142,7 +142,10 @@ class KVTaskManager:
                       and shm_te_channel_id is not None)
         if use_shm_te and not self.model_config.use_trtllm_subprocess:
             self.transfer_handles = [TransferManagerHandle(
-                model_config_for_transfer,
+                # Left behind by a rename: the sibling "process" branch below
+                # passes `model_config`, and no *_for_transfer variant exists —
+                # so the shm-TE path (radix_shmem) NameError'd on first use.
+                model_config,
                 self.cache_config,
                 mode="shm",
                 gpu_register_port=gpu_register_port,
@@ -396,9 +399,38 @@ class KVTaskManager:
         if task_id not in self.tasks:
             return
         task = self.tasks[task_id]
+        was_pending = task.status in (TaskStatus.UNREADY, TaskStatus.READY)
         if not task.is_completed():
             task.status = TaskStatus.CANCELLED
+            # The completion callback is what would have released the resources
+            # the graph claimed while it was built, and a cancelled task never
+            # gets there (_release_task drops it from graph_to_task, so a late
+            # op completion can no longer find it). Run the cancel-side release
+            # here instead.
+            self._run_cancel_cleanups(task, was_pending)
         self._release_task(task_id)
+
+    def _run_cancel_cleanups(self, task: KVTask, was_pending: bool) -> None:
+        graph = task.graph
+        if graph is None or not getattr(graph, "on_cancel", None):
+            return
+        if not was_pending:
+            # Cancelling a launched task does not stop its ops. Recycling a
+            # staging block a transfer is still writing into would corrupt the
+            # next holder, so leak it rather than hand it out twice.
+            flexkv_logger.warning(
+                f"task {task.task_id} cancelled after launch; leaving "
+                f"{len(graph.on_cancel)} in-flight resource claim(s) unreleased"
+            )
+            return
+        for cleanup in graph.on_cancel:
+            try:
+                cleanup()
+            except Exception as e:  # keep cancelling the remaining tasks
+                flexkv_logger.error(
+                    f"cancel cleanup failed for task {task.task_id}: {e}"
+                )
+        graph.on_cancel = []
 
     def check_completed(self, task_id: int, completely: bool = False) -> bool:
         task = self.tasks[task_id]

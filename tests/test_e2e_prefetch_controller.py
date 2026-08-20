@@ -150,7 +150,7 @@ def _bootstrap_proc(server_id, dp_size, ssd_dir, ready_evt, wrote_evt, done_evt,
         # Write a known shared prefix — lands in CPU and (on eviction) SSD.
         tok, slot, _ = _build_request(
             rng_seed=SHARED_SEED, start_block=0, n_blocks=BLOCK_PER_REQUEST)
-        tid = kvm.put_async(token_ids=tok, slot_mapping=slot, dp_id=0)
+        tid = kvm.put_async(token_ids=tok, slot_mapping=slot)
         s = kvm.wait([tid], timeout=60, completely=True)
         put_ok = all(v.status == KVResponseStatus.SUCCESS for v in s.values())
         print(f"{tag} shared-prefix put ok={put_ok}", flush=True)
@@ -164,7 +164,7 @@ def _bootstrap_proc(server_id, dp_size, ssd_dir, ready_evt, wrote_evt, done_evt,
             tk, sl, _ = _build_request(
                 rng_seed=7000 + i, start_block=(i + 1) * BLOCK_PER_REQUEST,
                 n_blocks=BLOCK_PER_REQUEST)
-            t = kvm.put_async(token_ids=tk, slot_mapping=sl, dp_id=0)
+            t = kvm.put_async(token_ids=tk, slot_mapping=sl)
             r = kvm.wait([t], timeout=60, completely=True)
             if all(v.status == KVResponseStatus.SUCCESS for v in r.values()):
                 concurrent_ok += 1
@@ -178,7 +178,7 @@ def _bootstrap_proc(server_id, dp_size, ssd_dir, ready_evt, wrote_evt, done_evt,
 
         # Verify the shared index reflects the prefix (get_match hit in CPU).
         for _ in range(50):
-            _mtid, mask = kvm.get_match(token_ids=tok, dp_id=0)
+            _mtid, mask = kvm.get_match(token_ids=tok)
             hit_blocks = int(np.count_nonzero(mask)) // TOKENS_PER_BLOCK \
                 if mask is not None else 0
             if hit_blocks > 0:
@@ -245,7 +245,7 @@ def _external_prefetch_proc(server_id, dp_size, ssd_dir, ready_evt, wrote_evt,
         all_ok = pc.is_done(tid)
         submitted = pc.submitted_count
         # graph_id our task used must be in our disjoint band (record before reap).
-        print(f"{tag} prefetch result={res} all_ok={all_ok} "
+        print(f"{tag} prefetch task_id={tid} all_ok={all_ok} "
               f"submitted={submitted} noop={pc.noop_count}", flush=True)
 
         # Pack both correctness signals: all_ok, id_isolated, and whether a real

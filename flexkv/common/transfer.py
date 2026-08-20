@@ -1,7 +1,7 @@
 import threading
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import ClassVar, List, Set, Dict, Callable, Tuple, Optional
+from typing import Any, ClassVar, List, Set, Dict, Callable, Tuple, Optional
 
 import numpy as np
 
@@ -237,6 +237,15 @@ class TransferOpGraph:
         # SEPARATE list because SWA lives in its own GPU pool / slot-id space and
         # must never be rebound with full-KV block ids (see add_transfer_op).
         self._swa_gpu_transfer_op_id: List[int] = []
+        # Cleanups for resources the BUILDER claimed before the graph ran and
+        # that only the completion callback would release. A cancelled task
+        # never reaches that callback, so without these the claim is lost for
+        # good — on the radixshmem backend staging slots are allocated out of
+        # the mempool and only insert() puts them back within reach, so a
+        # cancelled GET/PUT would leak them permanently. Run pre-launch only
+        # (see KVTaskManager._cancel_task): freeing a slot a transfer is still
+        # writing into would corrupt whoever gets it next.
+        self.on_cancel: List[Callable[[], None]] = []
 
     @classmethod
     def _get_graph_id(cls) -> int:
@@ -260,6 +269,27 @@ class TransferOpGraph:
 
     def set_graph_id(self, graph_id: int) -> None:
         self.graph_id = graph_id
+
+    def add_cancel_cleanup(self, cleanup: Callable[[], None]) -> None:
+        """Register a release for something claimed while building this graph.
+
+        Only fires if the task is cancelled before launch; a graph that runs
+        releases the same resource through its completion callback instead.
+        """
+        self.on_cancel.append(cleanup)
+
+    def __getstate__(self) -> Dict[str, Any]:
+        """Drop the cancel cleanups before the graph is pickled to the TE.
+
+        The graph travels to the transfer engine by pickle (mp.Pipe or
+        ShmChannel), and these closures reach back into the builder's cache
+        engines and pybind handles — none of which pickle. They are also useless
+        on the far side: cancellation is pre-launch and handled where the graph
+        was built (`KVTaskManager._cancel_task`), against this same object.
+        """
+        state = self.__dict__.copy()
+        state["on_cancel"] = []
+        return state
 
     @classmethod
     def create_empty_graph(cls) -> "TransferOpGraph":

@@ -751,6 +751,40 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Identifier used to name radix shm regions and TE shm channels. Lets
     # multiple FlexKV instances coexist on a host.
     shm_radix_server_id=os.getenv('FLEXKV_SHM_RADIX_ID', 'default'),
+    # Cross-node radixshmem cluster (distributed KV reuse). world_size > 1 turns
+    # the region into a distributed one (RDMA-connected router hash table +
+    # remote tree walks). Membership goes through etcd, the only cluster
+    # bootstrap path shmradix has: every node writes itself under
+    # <cluster_id>/peers and the leader gates on all `world_size` of them
+    # arriving, then assigns dense ranks by sorted key order.
+    #
+    # `radix_rank` is therefore only a LOCAL identity label — it names this
+    # node's shm region and its etcd key, so it must be unique per node but need
+    # not equal the cluster rank. The cluster rank is an OUTPUT read back from
+    # the region (`RadixClient.rank()`), and THAT is the FlexKV node id the peer
+    # data path (PEERH2H / PEERSSD2H) addresses. Using it as a node id requires a
+    # Redis instance dedicated to this one cluster, since node ids are otherwise
+    # handed out by `global:node_id`.
+    radix_rank=int(os.getenv('FLEXKV_RADIX_RANK', 0)),
+    radix_world_size=int(os.getenv('FLEXKV_RADIX_WORLD_SIZE', 1)),
+    # etcd endpoint carrying cluster membership, e.g. "etcd://10.0.0.1:2379".
+    radix_registry=os.getenv('FLEXKV_RADIX_REGISTRY', ''),
+    # Namespace under which this cluster's membership lives. Each tier gets its
+    # own sub-namespace (see shm_radix_bootstrap), since tiers bootstrap as
+    # independent clusters.
+    radix_cluster_id=os.getenv('FLEXKV_RADIX_CLUSTER_ID', 'flexkv'),
+    # Bootstrap IP peers dial, published to etcd. One of the two is required when
+    # world_size > 1; the interface name wins when both are set.
+    radix_rpc_address=os.getenv('FLEXKV_RADIX_RPC_ADDRESS', ''),
+    radix_rpc_interface=os.getenv('FLEXKV_RADIX_RPC_INTERFACE', ''),
+    radix_rdma_dev=os.getenv('FLEXKV_RADIX_RDMA_DEV', ''),
+    radix_gid_idx=int(os.getenv('FLEXKV_RADIX_GID_IDX', 3)),
+    radix_bootstrap_timeout_sec=int(os.getenv(
+        'FLEXKV_RADIX_BOOTSTRAP_TIMEOUT_SEC', 120
+    )),
+    # Control-plane transport for remote ops: "zmq" (TCP) or "dc" (RDMA DC,
+    # needs mlx5). Rank 0 is authoritative and broadcasts its choice.
+    radix_remote_op_transport=os.getenv('FLEXKV_RADIX_REMOTE_OP_TRANSPORT', 'dc'),
     # Extra shm TE channels reserved beyond the internal DP clients
     # (total_clients = instance_num * dp_size). External processes (e.g. a
     # prefetch controller attaching to the shared radix index) submit graphs to
