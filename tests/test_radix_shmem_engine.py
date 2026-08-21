@@ -296,8 +296,7 @@ def test_local_range_intersects_the_window():
 #   * only the peer tail crosses the wire (PEERH2H / PEERSSD2H), into freshly
 #     taken local slots that H2D then reads,
 #   * `src_block_node_ids` is sliced to exactly the blocks its own op moves,
-#   * the staged span is published to the local tree once the graph completes,
-#     and handed back to the mempool if the graph is cancelled instead.
+#   * the staged span is published to the local CPU tree once the graph completes.
 # =============================================================================
 
 TOKENS_PER_BLOCK = 16
@@ -374,8 +373,8 @@ def _force_radixshmem(engine,
     tree side is faked: the synthetic matches name no real prefix, and the tiers
     here are `CacheEngineAccel`s, whose `insert` signature is a different one.
     Records what a planner published (`engine.inserted_pools`) and what it handed
-    back (`engine.aborted_slots`) so completion and cancel paths can be asserted
-    without a shm region.
+    back (`engine.aborted_slots`) so the completion path can be asserted without
+    a shm region.
 
     Only `_match_radixshmem` is stubbed — `match_local_accel` stays untouched,
     since nothing on these paths is supposed to reach it.
@@ -448,18 +447,6 @@ def _graph_deps(graph, op_id):
     return set(graph._op_map[op_id].predecessors)
 
 
-def _abort_hooks(graph) -> list:
-    """The cancel hooks that hand staged slots back to the mempool.
-
-    PUT arms one `StagedRadixInsert.abort` per staged insert; GET publishes
-    nothing, so it arms its own `_return_staging` for the one staging allocation.
-    A graph also carries a `ShmRadixMatch.release` hook per tier (dropping the
-    query's refs on a graph that never runs), which says nothing about staging.
-    """
-    return [hook for hook in graph.on_cancel
-            if getattr(hook, "__name__", "") in ("abort", "_return_staging")]
-
-
 def _assert_peer_routing(op, peer_node_id: int = PEER_NODE_ID) -> None:
     """The routing contract for a peer op's ``src_block_node_ids``.
 
@@ -519,12 +506,13 @@ def test_local_cpu_head_goes_straight_to_gpu():
     assert return_mask.sum() == 4 * TOKENS_PER_BLOCK
 
 
-def test_staged_slots_go_back_on_completion():
-    """A GET does not promote: its staging is scratch, never a tree entry.
+def test_staged_slots_are_promoted_on_completion():
+    """The bytes are in host memory once the graph lands, so the CPU tree takes them.
 
-    Storing the sequence locally is the PUT path's job, so the completion
-    callback's only job with the slots is to give them back — and it is the only
-    way back, since a slot outside the tree is invisible to eviction.
+    Recycling instead would cost this request's own PUT a second D2H of the same
+    blocks, and leave every concurrent request on the prefix re-reading them off
+    the peer until then. The staged span always ENDS at the window end, so the
+    insert covers `[end - len(staging), end)`.
     """
     engine = _global_cache_engine()
     free_before = engine.cpu_cache_engine.mempool.num_free_blocks
@@ -537,40 +525,15 @@ def test_staged_slots_go_back_on_completion():
             == free_before - len(staged))
 
     engine.get_callback()                           # type: ignore[attr-defined]
-    assert engine.inserted_pools == []              # type: ignore[attr-defined]
-    aborted = engine.aborted_slots                  # type: ignore[attr-defined]
-    assert len(aborted) == 1
-    np.testing.assert_array_equal(aborted[0], staged)
-    assert engine.cpu_cache_engine.mempool.num_free_blocks == free_before
-
-
-def test_cancelled_graph_returns_the_staged_slots():
-    """A graph that never runs must hand its staging back to the mempool.
-
-    The slots are not in the tree, so nothing else can find them and eviction
-    cannot reclaim them: the cancel hook is the only way back.
-    """
-    engine = _global_cache_engine()
-    free_before = engine.cpu_cache_engine.mempool.num_free_blocks
-    graph, ops, _mask = _run_get(
-        engine, 4, _peer_match(np.arange(50, 54, dtype=np.int64)))
-    staged = ops[TransferType.PEERH2H][0].dst_block_ids
-    assert engine.cpu_cache_engine.mempool.num_free_blocks == free_before - len(staged)
-
-    assert len(_abort_hooks(graph)) == 1
-    for cleanup in graph.on_cancel:
-        cleanup()
-    aborted = engine.aborted_slots                  # type: ignore[attr-defined]
-    assert len(aborted) == 1
-    np.testing.assert_array_equal(aborted[0], staged)
-    assert engine.cpu_cache_engine.mempool.num_free_blocks == free_before
-
-    # Completion and cancel arm the same hook, so a late completion must be a
-    # no-op rather than a second free of slots the pool already took back.
-    engine.get_callback()                           # type: ignore[attr-defined]
-    assert engine.inserted_pools == []              # type: ignore[attr-defined]
-    assert len(engine.aborted_slots) == 1           # type: ignore[attr-defined]
-    assert engine.cpu_cache_engine.mempool.num_free_blocks == free_before
+    published = engine.inserted_pools               # type: ignore[attr-defined]
+    assert len(published) == 1
+    path_end, slots = published[0]
+    assert path_end == 4
+    np.testing.assert_array_equal(slots, staged)
+    # The tree owns them now, so they do NOT go back to the mempool.
+    assert engine.aborted_slots == []               # type: ignore[attr-defined]
+    assert (engine.cpu_cache_engine.mempool.num_free_blocks
+            == free_before - len(staged))
 
 
 def test_peer_ssd_tail_uses_peerssd2h():
@@ -660,11 +623,13 @@ def test_local_ssd_tail_stages_through_cpu_under_enable_gds():
     assert disk2h.op_id in _graph_deps(graph, h2d.op_id)
     assert return_mask.sum() == 4 * TOKENS_PER_BLOCK
 
-    # Staged, not promoted: the tail read off disk does not enter the CPU tree.
+    # The disk tail lands in host memory, so it is promoted into the CPU tree.
     engine.get_callback()                           # type: ignore[attr-defined]
-    assert engine.inserted_pools == []              # type: ignore[attr-defined]
-    np.testing.assert_array_equal(
-        engine.aborted_slots[0], disk2h.dst_block_ids)  # type: ignore[attr-defined]
+    published = engine.inserted_pools               # type: ignore[attr-defined]
+    assert len(published) == 1
+    assert published[0][0] == 4
+    np.testing.assert_array_equal(published[0][1], disk2h.dst_block_ids)
+    assert engine.aborted_slots == []               # type: ignore[attr-defined]
 
 
 def test_local_only_get_needs_no_staging():
@@ -678,7 +643,6 @@ def test_local_only_get_needs_no_staging():
     assert return_mask.sum() == 4 * TOKENS_PER_BLOCK
     # No staging taken, so nothing to publish and nothing to give back.
     assert engine.cpu_cache_engine.mempool.num_free_blocks == free_before
-    assert not _abort_hooks(graph)
     engine.get_callback()                           # type: ignore[attr-defined]
     assert engine.inserted_pools == []              # type: ignore[attr-defined]
 
@@ -862,19 +826,6 @@ def test_put_with_fully_cached_window_does_nothing():
     assert not bool(return_mask.any())
     assert engine.inserted_pools == []
     assert engine.aborted_slots == []
-
-
-def test_put_cancelled_graph_returns_the_staged_slots():
-    """Cancel before launch: the slots never held data, so they go back unpublished."""
-    engine = _global_cache_engine()
-    graph, _ops, _mask = _run_put(engine, num_blocks=4,
-                                  cpu_result=_local_match(np.array([])))
-    hooks = _abort_hooks(graph)
-    assert len(hooks) == 1                          # one staged CPU insert
-    for hook in graph.on_cancel:
-        hook()
-    assert [len(s) for s in engine.aborted_slots] == [4]
-    assert engine.inserted_pools == []
 
 
 # =============================================================================

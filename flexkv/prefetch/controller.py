@@ -478,10 +478,6 @@ class PrefetchController:
             holds=[drop_match_refs],
         )
 
-        # A transfer that never completes would otherwise strand the slots
-        # outside the tree for the life of the region.
-        graph.add_cancel_cleanup(staged.abort)
-
         return graph, staged.publish, op.op_id, n
 
     # ---- completion draining ----

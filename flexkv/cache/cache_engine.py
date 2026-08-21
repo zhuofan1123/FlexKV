@@ -1845,8 +1845,10 @@ class GlobalCacheEngine:
             finished_ops_ids = list(staging_ops_ids)
 
         cleanups: List[Callable[[], None]] = []
-        cancels: List[Callable[[], None]] = []
         if len(staging) > 0:
+            # cpu_match's ref goes to the staged insert, not the cleanup list: it
+            # keeps the tree reaching the run's start, so it may only drop after
+            # publish.
             staged = StagedRadixInsert(engine=self.cpu_cache_engine,
                                        sequence_meta=sequence_meta,
                                        slots=staging,
@@ -1854,14 +1856,9 @@ class GlobalCacheEngine:
                                        label=f"GET {request_id} CPU promote",
                                        holds=[cpu_match.release])
             cleanups.append(staged.publish)
-            cancels.append(staged.abort)
         else:
             cleanups.append(cpu_match.release)
-            cancels.append(cpu_match.release)
         cleanups.append(ssd_match.release)
-        cancels.append(ssd_match.release)
-        for cleanup in cancels:
-            transfer_graph.add_cancel_cleanup(cleanup)
 
         nvtx.end_range(nvtx_range)
         return GetTransferPlan(
@@ -2623,7 +2620,6 @@ class GlobalCacheEngine:
                                         label=label,
                                         holds=[hold])
             on_complete.append(staged.publish)
-            transfer_graph.add_cancel_cleanup(staged.abort)
 
         _arm(self.cpu_cache_engine, cpu_new,
              cpu_match.release, f"PUT {request_id} CPU")
@@ -2632,7 +2628,6 @@ class GlobalCacheEngine:
                  ssd_match.release, f"PUT {request_id} SSD")
         else:
             on_complete.append(ssd_match.release)
-            transfer_graph.add_cancel_cleanup(ssd_match.release)
 
         return PutTransferPlan(
             transfer_graph=transfer_graph,

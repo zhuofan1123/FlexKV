@@ -25,8 +25,8 @@ Differences from `CacheEngineAccel`:
 Insert happens AFTER transfer. There is no "ready" bit; a block is published by
 being in the tree at all, so the order is `take() -> transfer -> insert()`.
 Consequences: `insert()` must be called from the completion path, not while
-building the graph; a failed or cancelled transfer leaves slots attached to
-nothing (neither reachable nor evictable) which leak unless `recycle()`d; and
+building the graph; a graph that never completes leaves its slots attached to
+nothing -- neither reachable nor evictable, so they leak; and
 `insert(auto_recycle=True)` takes slot ownership, so the caller must not recycle
 the same slots again.
 
@@ -162,18 +162,14 @@ class StagedRadixInsert:
 
     radixshmem admits a block only when it already holds data, so the insert has
     to run from a completion callback. Until then the slots are owned by nobody
-    but this object, and exactly one of its two exits must run or they are lost
-    for the life of the region:
+    but this object, and ``publish`` must run or they are lost for the life of
+    the region: it hands them to the tree, which takes ownership and recycles
+    whatever did not attach.
 
-      ``publish`` -- transfer landed; hand the slots to the tree, which takes
-                     ownership and recycles whatever did not attach
-      ``abort``   -- data never landed; give them straight back to the mempool
-
-    Mutually exclusive and each idempotent, so completion and cancel can both be
-    armed. ``publish`` takes no ref on what it attached (the transfer is over, so
-    the span has no reader), but it IS only legal while the ref keeping the local
-    tree reaching the span's start is held -- pass that as ``holds`` and both exits
-    drop it afterwards.
+    ``publish`` takes no ref on what it attached (the transfer is over, so the
+    span has no reader), but it IS only legal while the ref keeping the local
+    tree reaching the span's start is held -- pass that as ``holds``, which it
+    drops afterwards.
     """
 
     def __init__(self,
@@ -208,19 +204,6 @@ class StagedRadixInsert:
                 f"radixshmem {self._label}: insert of {len(self._slots)} "
                 f"staged slots failed: {e}; returning them to the mempool"
             )
-            self._engine.recycle(self._slots)
-        finally:
-            self._release_holds()
-
-    def abort(self) -> None:
-        if self._settled:
-            return
-        self._settled = True
-        flexkv_logger.debug(
-            f"radixshmem {self._label}: returning {len(self._slots)} staged "
-            f"slots, their data never landed"
-        )
-        try:
             self._engine.recycle(self._slots)
         finally:
             self._release_holds()
