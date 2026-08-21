@@ -172,8 +172,6 @@ class KVManager:
         )
         from flexkv.transfer_manager import TransferManagerShmTEProcess
 
-        # dp_client_id is the flat cross-instance label, so id 0 is the single
-        # bootstrap proc (same rule the server_client_mode branch uses).
         is_bootstrap = (self.dp_client_id == 0)
         total_clients = self.model_config.total_clients
         server_id = self._shm_radix_server_id
@@ -181,17 +179,12 @@ class KVManager:
         radix_world_size = getattr(
             GLOBAL_CONFIG_FROM_ENV, "radix_world_size", 1
         )
-        # Two simulated ranks can share one host, so keep their TE channel / shm
-        # namespaces apart.
+
         te_server_id = (
             f"{server_id}_r{radix_rank}"
             if radix_world_size > 1 else server_id
         )
 
-        # Disjoint graph_id and op_id ranges per CE process: 2^32 ids per CE,
-        # high bits = dp_client_id. Critical for the multi-DP path where all CE
-        # procs feed a single TE that uses op_id as a primary key for internal
-        # bookkeeping (op_id_to_op, op_id_to_nvtx_range, etc.).
         from flexkv.common.transfer import TransferOp
         TransferOpGraph.set_graph_id_range(
             self.dp_client_id << 32,
@@ -202,9 +195,6 @@ class KVManager:
             (self.dp_client_id + 1) << 32,
         )
 
-        # Radix regions come up FIRST: the cluster rank is an etcd-assigned
-        # output of bootstrap, and it is the FlexKV node id everything downstream
-        # (Redis registration, then the TE process) is keyed on.
         if is_bootstrap:
             self._shm_radix_owners = create_shm_radix_regions(
                 self.model_config, self.cache_config,
@@ -233,9 +223,6 @@ class KVManager:
             )
             cluster_rank = self._shm_radix_owners.cluster_rank
         else:
-            # Wait until bootstrap created the shm radix regions before
-            # GlobalCacheEngine tries to attach as RadixClient, and read the
-            # cluster rank straight off the region — no second rendezvous.
             clients = attach_shm_radix_clients(
                 self.cache_config,
                 server_id=server_id,
@@ -246,18 +233,6 @@ class KVManager:
                             if clients else radix_rank)
 
         if self.cache_config.enable_kv_sharing:
-            # A distributed radix query names its peer by cluster RANK, and the
-            # peer data path (PEERH2H / PEERSSD2H) addresses it by FlexKV node
-            # id — so make them the same number. etcd hands out the rank during
-            # bootstrap and every process reads it back off the shm region, so
-            # the index control plane still needs no Redis at all: Redis is left
-            # carrying only the data path's address book (`meta:<id>` =
-            # mooncake/zmq addresses + buffer base pointers, `node:<id>` =
-            # liveness TTL), published by the transfer worker. Only the bootstrap
-            # proc registers, since all DP procs of a rank share one node
-            # identity (one mooncake engine in the shared TE process), and it
-            # must happen BEFORE the TE process is spawned — that reads
-            # cache_config.distributed_node_id.
             node_id = cluster_rank
             flexkv_logger.info(
                 f"[kv manager] radix local label r{radix_rank} -> cluster rank "
