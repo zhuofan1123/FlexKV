@@ -200,9 +200,10 @@ cleanup() {
   #    not reap; it holds no GPU and clears on container restart.
   echo quit | nvidia-cuda-mps-control 2>/dev/null
   pkill -9 nvidia-cuda-mps 2>/dev/null
-  # 5) the POSIX shm radix / TE regions for this run, plus the ssd tier's block
-  #    files -- those are GBs; the logs next to them are kept
+  # 5) the radix / TE regions for this run -- both backings, since shmradix takes
+  #    hugetlbfs when it is mounted -- plus the ssd tier's GB-sized block files
   rm -f /dev/shm/*flexkv* /dev/shm/*shmradix* /dev/shm/*"${SHM_ID}"* 2>/dev/null
+  rm -f /dev/hugepages/*flexkv* /dev/hugepages/*shmradix* /dev/hugepages/*"${SHM_ID}"* 2>/dev/null
   rm -f /tmp/flexkv_"${SHM_ID}"* 2>/dev/null
   rm -rf "$LOG_DIR"/ssd_r* 2>/dev/null
   # 6) the etcd + redis this run started, last so the engines are gone before
@@ -329,6 +330,7 @@ done
 # pre-clean stale state
 for ((i=0; i<NODES; i++)); do fuser -k "$(( PORT_BASE + i ))/tcp" 2>/dev/null; done
 rm -f /dev/shm/*flexkv* /dev/shm/*shmradix* 2>/dev/null
+rm -f /dev/hugepages/*flexkv* /dev/hugepages/*shmradix* 2>/dev/null
 echo quit | nvidia-cuda-mps-control 2>/dev/null   # release GPU held by a stale daemon
 pkill -9 nvidia-cuda-mps 2>/dev/null
 

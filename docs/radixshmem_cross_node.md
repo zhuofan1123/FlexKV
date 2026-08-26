@@ -76,10 +76,10 @@ apt-get install -y etcd-server etcd-client redis-server
 ### 2.1 shmradix：必须带 RDMA + etcd
 
 源码：<https://gitlab-master.nvidia.com/zhuofanl/radixshmem>，本文对应 **`dev` 分支**
-（写作时 `26e3885 registry: lift the etcd plane out of the indexer`）。
+（写作时 `7653328 python: declare the console script where PEP 621 can see it`）。
 
 ```bash
-git clone -b dev ssh://git@gitlab-master.nvidia.com:12051/haoxu/radixshmem.git
+git clone -b dev ssh://git@gitlab-master.nvidia.com:12051/zhuofanl/radixshmem.git
 cd radixshmem
 pip install -e python --no-build-isolation
 ```

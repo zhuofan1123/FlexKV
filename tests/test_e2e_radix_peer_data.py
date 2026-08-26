@@ -596,11 +596,12 @@ def main() -> int:
         for rank in range(WORLD_SIZE):
             for device in (DeviceType.CPU, DeviceType.SSD):
                 name = shm_name_for(device, node_tag_for(run_id, rank))
-                # A distributed region appends shmradix's node identity, and its
-                # RHT shards extend that again -- so sweep by prefix.
-                for stale in glob.glob(f"/dev/shm{name}*"):
-                    with contextlib.suppress(OSError):
-                        os.unlink(stale)
+                # A distributed region appends shmradix's node identity and its RHT
+                # shards extend that again, so sweep both backings by prefix.
+                for root in ("/dev/shm", "/dev/hugepages"):
+                    for stale in glob.glob(f"{root}{name}*"):
+                        with contextlib.suppress(OSError):
+                            os.unlink(stale)
         shutil.rmtree(redis_dir, ignore_errors=True)
 
     print("\n=== RESULTS ===")
