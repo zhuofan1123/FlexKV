@@ -1,4 +1,4 @@
-"""End-to-end DATA check for the radixshmem peer path (PEERH2H).
+"""End-to-end DATA check for the radixshmem peer path.
 
 The 2-rank tests in `tests/test_radix_shmem_engine.py` cover the CONTROL plane
 only: the writer publishes hashes without ever filling a block, and the reader
@@ -17,24 +17,38 @@ Topology (single host, two processes, two GPUs):
     that name is the identity shmradix registers under in etcd;
   * each node registers its CPU block buffer with its own mooncake engine and
     publishes `meta:<node_id>` (mooncake addr + buffer base) to a shared Redis,
-    which is how PEERH2H turns a peer's slot id into an RDMA/TCP read;
-  * node 0 writes a per-(layer, block) pattern from GPU, node 1 never writes.
+    which is how a peer read turns a peer's slot id into an RDMA/TCP transfer;
+  * both tiers and both peer routes are enabled on both nodes, so nothing about
+    the route is pinned by config. Which source served a block is read off the
+    BYTES instead: the two nodes write different content for the same block, so
+    a span boundary is where the content's writer changes.
 
-The route is pinned by config rather than asserted on a log line: with
-`tier="cpu"` the reader has no SSD tier at all, and with `tier="ssd"` it has
-`enable_p2p_cpu=False`, which makes the CPU engine's `match` a local-only
-walk. So in each mode exactly one cross-node route can exist, and since the
-reader never writes the pattern itself, matching bytes can only have come over
-that route.
+What this validates, over two independent windows:
+  1. a window node 1 holds nothing of comes back whole off node 0 -- a
+     cross-node match over RDMA, then a PEERH2H that reads the RIGHT bytes:
+     `ShmRadixMatch.peer_range` / `peer_node_ids` addressing a peer's slots is
+     checked against the actual content, not just against expected ids;
+  2. a window whose four prefixes are laid out
+         node 1 CPU < node 0 CPU < node 1 SSD < node 0 SSD (= the whole window)
+     comes back as the four-way splice `_shm_get_spans` exists for, each quarter
+     carrying the bytes of the node whose tier it must have come from. Serving
+     any of them off the wrong tier or the wrong node is a mismatch, not a pass.
 
-What this validates:
-  1. node 1's GET finds the prefix on node 0 (cross-node match over RDMA);
-  2. the PEERH2H op reads the RIGHT bytes -- `ShmRadixMatch.peer_range` /
-     `peer_node_ids` addressing a peer's slots is checked against the actual
-     content, not just against expected ids;
-  3. the route is repeatable: a GET does not promote what it read into node 1's
-     own tree, so after wiping node 1's GPU blocks the second GET crosses to node
-     0 again and must return the identical bytes.
+Leaving a tier holding LESS than the tier behind it takes a CPU-tree reset: a
+PUT is write-through, so it gives CPU and SSD the same prefix, and only a
+shorter re-PUT after dropping the CPU tree separates them. That reset also wipes
+the RHT shard the node hosts -- other nodes' entries included -- so each node
+resets before publishing anything that must survive: node 1 lays its layers down
+before node 0 publishes at all, and node 0 publishes the first window after its
+own reset.
+
+The spliced case also needs an RHT bucket with room for more than one owner, so
+this sets SHMRADIX_RHT_SLOTS=4. Routing to a peer goes through the bucket of a
+tree node's FIRST hash, a query republishes its own local hit into that bucket
+before probing it, and at shmradix's default of one slot per bucket that write
+is a blind overwrite -- so a reader holding the prefix always finds only itself
+there and no peer tail can be routed at all. Nothing shorter than the 128-block
+register chunk has a second probe position to fall back on.
 
 Requires: >=2 CUDA devices, an ACTIVE RDMA port, `redis-server` on PATH, and an
 etcd endpoint in FLEXKV_TEST_RADIX_REGISTRY (the radix cluster's only
@@ -52,14 +66,8 @@ one redis-server this test starts. A wheel build (no redis plugin) aborts at
 libcudart.so.12 -- hence `CUDART12_LIB`, the nvidia/cuda_runtime/lib wheel
 directory, which a cu13 torch install does not otherwise provide.
 
-`FLEXKV_TEST_PEER_TIER` picks which tier carries the peer tail: `cpu` (default,
-PEERH2H) or `ssd` (PEERSSD2H, node 0 serving out of its own SSD files).
-
-⚠️ `ssd` also needs a CPU tier for staging, so each node bootstraps TWO
-distributed trees -- and a node has ONE etcd identity for all of them, so its two
-trees overwrite each other's `/peers` entry. FlexKV catches that as "assigned
-different cluster ranks per tier" and refuses to start, so until shmradix
-namespaces per tree only `cpu` is runnable here.
+Each node bootstraps two distributed trees, one per tier; they get separate etcd
+namespaces and separate RHTs, so they do not collide.
 """
 from __future__ import annotations
 
@@ -82,11 +90,26 @@ TOKENS_PER_BLOCK = 16
 NUM_GPU_BLOCKS = 64
 NUM_CPU_BLOCKS = 512
 NUM_SSD_BLOCKS = 512
-# One request, written by node 0 and read by node 1.
+# Two requests, on distinct GPU blocks and distinct tokens so that what a GET of
+# the first promotes into node 1's tree cannot serve any part of the second.
 NUM_REQUEST_BLOCKS = 16
 FIRST_BLOCK = 8
+SPLICED_FIRST_BLOCK = FIRST_BLOCK + NUM_REQUEST_BLOCKS
 PATTERN_SEED = 0xBEEF
+SPLICED_SEED = 0xCAFE
 WORLD_SIZE = 2
+
+# Prefix each tier of each node is left holding of the second window, and the
+# resulting spans of its GET: read in place, PEERH2H, DISK2H, PEERSSD2H.
+LOCAL_CPU_BLOCKS = 3
+PEER_CPU_BLOCKS = 6
+LOCAL_SSD_BLOCKS = 10
+SPLICED_SPANS = (
+    ("local_cpu", 0, LOCAL_CPU_BLOCKS, 1),
+    ("peer_cpu", LOCAL_CPU_BLOCKS, PEER_CPU_BLOCKS, 0),
+    ("local_ssd", PEER_CPU_BLOCKS, LOCAL_SSD_BLOCKS, 1),
+    ("peer_ssd", LOCAL_SSD_BLOCKS, NUM_REQUEST_BLOCKS, 0),
+)
 
 
 def node_tag_for(run_id: str, rank: int) -> str:
@@ -146,23 +169,27 @@ def _active_rdma_devices() -> list:
     return active
 
 
-def _block_pattern(layer: int, block_id: int, shape, dtype) -> torch.Tensor:
-    """Deterministic content for one (layer, block), distinct for each pair.
+def _block_pattern(layer: int, block_id: int, shape, dtype,
+                   writer: int = 0) -> torch.Tensor:
+    """Deterministic content for one (layer, block) as written by node `writer`.
 
     Random rather than structured so that a transfer landing on the wrong block
     or the wrong layer cannot accidentally compare equal, and generated on the
     CPU so both nodes derive it identically without talking to each other.
+    `writer` makes the same block differ between the two nodes, which is how a
+    byte comparison alone can tell which node's copy a GET served.
     """
-    generator = torch.Generator().manual_seed(PATTERN_SEED + block_id * 128 + layer)
+    generator = torch.Generator().manual_seed(
+        PATTERN_SEED + writer * 1_000_003 + block_id * 128 + layer)
     return torch.randn(tuple(shape), generator=generator).to(dtype)
 
 
-def _write_pattern(gpu_tensors, block_ids) -> None:
+def _write_pattern(gpu_tensors, block_ids, writer: int = 0) -> None:
     for layer, tensor in enumerate(gpu_tensors):
         for block_id in block_ids:
             block = tensor[:, block_id]
-            block.copy_(_block_pattern(layer, int(block_id),
-                                       block.shape, tensor.dtype))
+            block.copy_(_block_pattern(layer, int(block_id), block.shape,
+                                       tensor.dtype, writer))
     torch.cuda.synchronize()
 
 
@@ -174,26 +201,75 @@ def _clear_blocks(gpu_tensors, block_ids) -> None:
     torch.cuda.synchronize()
 
 
-def _mismatched_blocks(gpu_tensors, block_ids) -> list:
-    """(layer, block) pairs whose content is not what node 0 wrote."""
+def _mismatched_blocks(gpu_tensors, block_ids, writer: int = 0) -> list:
+    """(layer, block) pairs whose content is not what node `writer` wrote."""
     bad = []
     for layer, tensor in enumerate(gpu_tensors):
         for block_id in block_ids:
             got = tensor[:, block_id].cpu()
-            want = _block_pattern(layer, int(block_id), got.shape, got.dtype)
+            want = _block_pattern(layer, int(block_id), got.shape, got.dtype,
+                                  writer)
             if not torch.equal(got, want):
                 bad.append((layer, int(block_id)))
     return bad
 
 
-def _build_request(num_blocks: int, first_block: int):
+def _build_request(num_blocks: int, first_block: int, seed: int):
     """token_ids / slot_mapping for `num_blocks` GPU blocks starting at first."""
-    rng = np.random.default_rng(PATTERN_SEED)
+    rng = np.random.default_rng(seed)
     block_ids = np.arange(first_block, first_block + num_blocks, dtype=np.int64)
     slot_mapping = (np.repeat(block_ids, TOKENS_PER_BLOCK) * TOKENS_PER_BLOCK
                     + np.tile(np.arange(TOKENS_PER_BLOCK), num_blocks))
     token_ids = rng.integers(0, 32000, size=slot_mapping.shape, dtype=np.int64)
     return token_ids, slot_mapping, block_ids
+
+
+def _windows():
+    """The peer-only window and the spliced one, in the order the reader uses
+    them. Both nodes derive them the same way instead of exchanging them."""
+    return (_build_request(NUM_REQUEST_BLOCKS, FIRST_BLOCK, PATTERN_SEED),
+            _build_request(NUM_REQUEST_BLOCKS, SPLICED_FIRST_BLOCK,
+                           SPLICED_SEED))
+
+
+def _put_prefix(kvm, token_ids, slot_mapping, num_blocks: int) -> bool:
+    """PUT the window's first `num_blocks` blocks; True if the task completed."""
+    from flexkv.common.request import KVResponseStatus
+
+    num_tokens = num_blocks * TOKENS_PER_BLOCK
+    task_id = kvm.put_async(token_ids=token_ids[:num_tokens],
+                            slot_mapping=slot_mapping[:num_tokens])
+    status = kvm.wait([task_id], timeout=120, completely=True)
+    return all(r.status == KVResponseStatus.SUCCESS for r in status.values())
+
+
+def _get_once(kvm, token_ids, slot_mapping) -> int:
+    """One GET; how many blocks it matched, 0 if it did not succeed."""
+    from flexkv.common.request import KVResponseStatus
+
+    task_id = kvm.get_async(token_ids=token_ids, slot_mapping=slot_mapping)
+    response = kvm.wait([task_id], timeout=120, completely=True)[task_id]
+    if response.status != KVResponseStatus.SUCCESS or response.return_mask is None:
+        return 0
+    return int(np.count_nonzero(response.return_mask)) // TOKENS_PER_BLOCK
+
+
+def _get_until_full_hit(kvm, token_ids, slot_mapping, want_blocks: int,
+                        timeout: float = 60.0) -> int:
+    """GET until the whole window is matched, returning the last hit count.
+
+    The peer's RHT publication and its Redis meta are both async, so early
+    attempts can legitimately miss; a partial count is reported rather than
+    raised so the caller can say how far it got.
+    """
+    hit = 0
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        hit = _get_once(kvm, token_ids, slot_mapping)
+        if hit >= want_blocks:
+            break
+        time.sleep(0.5)
+    return hit
 
 
 def _write_mooncake_config(path: str, port: int, metadata_url: str,
@@ -248,9 +324,9 @@ def _tp_client_proc(server_recv_port, model_config, cache_config,
 
 
 def _node_proc(rank, gpu_id, run_id, registry, cluster_id, rdma_dev,
-               redis_port, mooncake_config, zmq_port, tier, ssd_dir,
-               written, read_done, result_q):
-    """One FlexKV node: rank 0 writes the prefix, rank 1 reads it off the peer."""
+               redis_port, mooncake_config, zmq_port, ssd_dir,
+               reader_ready, written, read_done, result_q):
+    """One FlexKV node: rank 0 writes the prefixes, rank 1 reads them back."""
     # Before any CUDA context exists, so each node drives a different device
     # while still addressing it as device 0 (KVTPClient derives the device id
     # from dp_client_id/tp_rank, which are 0 on both nodes).
@@ -277,11 +353,12 @@ def _node_proc(rank, gpu_id, run_id, registry, cluster_id, rdma_dev,
         # Log the peer query so a failure shows whether the match or the
         # transfer is the part that went wrong.
         "FLEXKV_TRACE_RADIX_PEER": "1",
+        # Needed for the spliced case; see the module docstring.
+        "SHMRADIX_RHT_SLOTS": os.getenv("SHMRADIX_RHT_SLOTS", "4"),
     })
 
     from flexkv.common.config import (CacheConfig, GLOBAL_CONFIG_FROM_ENV,
                                       ModelConfig)
-    from flexkv.common.request import KVResponseStatus
     from flexkv.kvmanager import KVManager
 
     # The module-level config object is built from env at import time, which the
@@ -301,20 +378,15 @@ def _node_proc(rank, gpu_id, run_id, registry, cluster_id, rdma_dev,
         num_layers=2, num_kv_heads=4, head_size=128,
         dtype=torch.float16, use_mla=False, tp_size=1, dp_size=1,
     )
-    # Which tier carries the peer tail is decided by `enable_p2p_<tier>`: the
-    # radixshmem engine is built with `peer_enabled=enable_p2p_<tier>` and its
-    # `match` collapses to a local walk when that is off. So `tier="ssd"`
-    # keeps a local CPU tier for staging while the only peer route is PEERSSD2H.
-    peer_ssd = tier == "ssd"
     cache_config = CacheConfig(
         tokens_per_block=TOKENS_PER_BLOCK,
-        enable_cpu=True, enable_ssd=peer_ssd, enable_remote=False,
+        enable_cpu=True, enable_ssd=True, enable_remote=False,
         num_cpu_blocks=NUM_CPU_BLOCKS,
-        num_ssd_blocks=NUM_SSD_BLOCKS if peer_ssd else 0,
-        ssd_cache_dir=ssd_dir if peer_ssd else None,
+        num_ssd_blocks=NUM_SSD_BLOCKS,
+        ssd_cache_dir=ssd_dir,
         # The data plane: mooncake for the bytes, Redis for the address book.
-        enable_p2p_cpu=not peer_ssd,
-        enable_p2p_ssd=peer_ssd,
+        enable_p2p_cpu=True,
+        enable_p2p_ssd=True,
         redis_host="127.0.0.1", redis_port=redis_port,
         local_ip="127.0.0.1",
         local_zmq_ip="127.0.0.1", local_zmq_port=zmq_port,
@@ -348,60 +420,69 @@ def _node_proc(rank, gpu_id, run_id, registry, cluster_id, rdma_dev,
         report["node_id"] = int(cache_config.distributed_node_id)
         print(f"{tag} READY as FlexKV node id {report['node_id']}", flush=True)
 
-        token_ids, slot_mapping, block_ids = _build_request(
-            NUM_REQUEST_BLOCKS, FIRST_BLOCK)
+        peer_win, spliced_win = _windows()
+        peer_tokens, peer_slots, peer_blocks = peer_win
+        tokens, slots, blocks = spliced_win
 
-        if rank == 0:
-            _write_pattern(gpu_tensors, block_ids)
-            task_id = kvm.put_async(token_ids=token_ids,
-                                    slot_mapping=slot_mapping)
-            status = kvm.wait([task_id], timeout=120, completely=True)
-            report["put_ok"] = all(r.status == KVResponseStatus.SUCCESS
-                                   for r in status.values())
+        if rank == 1:
+            # This node's two layers, before node 0 publishes anything: the
+            # reset takes the RHT shard this node hosts down with it.
+            _write_pattern(gpu_tensors, blocks[:LOCAL_SSD_BLOCKS], writer=1)
+            ok = _put_prefix(kvm, tokens, slots, LOCAL_SSD_BLOCKS)
+            kvm._clear_cpu_cache()
+            report["layers_put_ok"] = _put_prefix(
+                kvm, tokens, slots, LOCAL_CPU_BLOCKS) and ok
+            print(f"{tag} layers ok={report['layers_put_ok']}", flush=True)
+            reader_ready.set()
+            if not written.wait(180):
+                raise TimeoutError("writer did not publish in 180s")
+
+            # 1) Entirely off the peer: this node holds nothing of this window.
+            _clear_blocks(gpu_tensors, peer_blocks)
+            hit = _get_until_full_hit(kvm, peer_tokens, peer_slots,
+                                      NUM_REQUEST_BLOCKS)
+            report["peer_hit_blocks"] = hit
+            report["peer_mismatched"] = _mismatched_blocks(gpu_tensors,
+                                                           peer_blocks)
+            print(f"{tag} peer GET: hit_blocks={hit} "
+                  f"mismatched={len(report['peer_mismatched'])}", flush=True)
+
+            # 2) The four-way splice, in one shot: a GET promotes what it staged
+            # into this node's CPU tree, so a retry would not see the layering.
+            _clear_blocks(gpu_tensors, blocks)
+            report["spliced_hit_blocks"] = _get_once(kvm, tokens, slots)
+            for label, first, last, writer in SPLICED_SPANS:
+                report[f"spliced_{label}_mismatched"] = _mismatched_blocks(
+                    gpu_tensors, blocks[first:last], writer=writer)
+            print(f"{tag} spliced GET: hit_blocks={report['spliced_hit_blocks']}"
+                  + "".join(f" {label}_mismatched="
+                            f"{len(report[f'spliced_{label}_mismatched'])}"
+                            for label, *_ in SPLICED_SPANS), flush=True)
+            read_done.set()
+        else:
+            if not reader_ready.wait(180):
+                raise TimeoutError("reader did not lay down its layers in 180s")
+            # A PUT is write-through, so this leaves both tiers holding the whole
+            # window; the reset plus the shorter re-PUT is what parts them.
+            _write_pattern(gpu_tensors, blocks)
+            ok = _put_prefix(kvm, tokens, slots, NUM_REQUEST_BLOCKS)
+            kvm._clear_cpu_cache()
+            ok = _put_prefix(kvm, tokens, slots, PEER_CPU_BLOCKS) and ok
+            # After the reset, so the reset cannot take it with it.
+            _write_pattern(gpu_tensors, peer_blocks)
+            report["put_ok"] = _put_prefix(kvm, peer_tokens, peer_slots,
+                                           NUM_REQUEST_BLOCKS) and ok
             print(f"{tag} put ok={report['put_ok']}", flush=True)
             written.set()
-            # Stay up: the reader RDMA-reads THIS process's registered buffer,
-            # and shutdown would unregister it and drop the Redis meta.
-            if not read_done.wait(180):
-                raise TimeoutError("reader did not finish in 180s")
-        else:
-            _clear_blocks(gpu_tensors, block_ids)
-            if not written.wait(120):
-                raise TimeoutError("writer did not publish in 120s")
-
-            # Two GETs, both off the peer: this node has written nothing, and a
-            # GET stages without publishing, so the first one leaves no local copy
-            # for the second to be served from.
-            for attempt, key in enumerate(("first", "second")):
-                hit_blocks, mismatched = 0, None
-                # The peer's RHT publication and its Redis meta are both async,
-                # so the first attempts can legitimately miss.
-                deadline = time.monotonic() + 60
-                while time.monotonic() < deadline:
-                    task_id = kvm.get_async(token_ids=token_ids,
-                                            slot_mapping=slot_mapping)
-                    status = kvm.wait([task_id], timeout=120, completely=True)
-                    response = status[task_id]
-                    mask = response.return_mask
-                    hit_blocks = (int(np.count_nonzero(mask)) // TOKENS_PER_BLOCK
-                                  if mask is not None else 0)
-                    if (response.status == KVResponseStatus.SUCCESS
-                            and hit_blocks >= NUM_REQUEST_BLOCKS):
-                        break
-                    time.sleep(0.5)
-                mismatched = _mismatched_blocks(gpu_tensors, block_ids)
-                report[f"{key}_hit_blocks"] = hit_blocks
-                report[f"{key}_mismatched"] = mismatched
-                print(f"{tag} {key} GET: hit_blocks={hit_blocks} "
-                      f"mismatched={len(mismatched)}", flush=True)
-                if attempt == 0:
-                    # Wipe again so the second GET has to refill the blocks.
-                    _clear_blocks(gpu_tensors, block_ids)
-            read_done.set()
+            # Stay up: the reader reads THIS process's registered buffer and its
+            # SSD files, and shutdown would drop both from the address book.
+            if not read_done.wait(240):
+                raise TimeoutError("reader did not finish in 240s")
     except Exception:
         import traceback
         report["error"] = traceback.format_exc()
         print(f"{tag} FAILED\n{report['error']}", flush=True)
+        reader_ready.set()
         written.set()
         read_done.set()
     finally:
@@ -432,12 +513,6 @@ def main() -> int:
               "address book")
         return 0
 
-    tier = os.getenv("FLEXKV_TEST_PEER_TIER", "cpu").lower()
-    if tier not in ("cpu", "ssd"):
-        print("FAIL: FLEXKV_TEST_PEER_TIER must be 'cpu' (PEERH2H) or 'ssd' "
-              "(PEERSSD2H)")
-        return 1
-
     rdma_dev = devices[0]
     protocol = os.getenv("FLEXKV_TEST_MOONCAKE_PROTOCOL", "tcp")
     run_id = f"peerdata{os.getpid()}"
@@ -465,7 +540,7 @@ def main() -> int:
         configs.append(path)
 
     ctx = mp.get_context("spawn")
-    written, read_done = ctx.Event(), ctx.Event()
+    reader_ready, written, read_done = ctx.Event(), ctx.Event(), ctx.Event()
     result_q = ctx.Queue()
     procs = []
     try:
@@ -481,7 +556,7 @@ def main() -> int:
             print("FAIL: redis-server did not come up")
             return 1
 
-        print(f"peer tier {tier}, redis on 127.0.0.1:{redis_port}, "
+        print(f"redis on 127.0.0.1:{redis_port}, "
               f"mooncake metadata {meta_url}, etcd {registry}, "
               f"rdma {rdma_dev}, mooncake protocol {protocol}", flush=True)
         # Two consecutive ports per rank, non-overlapping across ranks.
@@ -490,8 +565,9 @@ def main() -> int:
             proc = ctx.Process(
                 target=_node_proc,
                 args=(rank, rank, run_id, registry, cluster_id, rdma_dev,
-                      redis_port, configs[rank], zmq_base + rank * 2, tier,
-                      ssd_dirs[rank], written, read_done, result_q),
+                      redis_port, configs[rank], zmq_base + rank * 2,
+                      ssd_dirs[rank], reader_ready, written, read_done,
+                      result_q),
                 daemon=False,
             )
             proc.start()
@@ -547,22 +623,33 @@ def main() -> int:
     if not writer.get("put_ok"):
         print("FAIL: writer's put did not complete")
         return 1
-    route = "PEERSSD2H" if tier == "ssd" else "PEERH2H"
-    for key, what in (("first", f"{route} from node 0"),
-                      ("second", f"a repeat GET over {route}")):
+    if not reader.get("layers_put_ok"):
+        print("FAIL: reader's puts of its own two layers did not complete")
+        return 1
+    for key, what in (("peer", "the whole window off node 0"),
+                      ("spliced", "the four-way spliced window")):
         hit = reader.get(f"{key}_hit_blocks", 0)
-        bad = reader.get(f"{key}_mismatched")
         if hit < NUM_REQUEST_BLOCKS:
             print(f"FAIL: {what}: matched {hit}/{NUM_REQUEST_BLOCKS} blocks")
             return 1
+    bad = reader.get("peer_mismatched")
+    if bad:
+        print(f"FAIL: the whole window off node 0: {len(bad)} (layer, block) "
+              f"pairs hold the wrong bytes, e.g. {bad[:5]}")
+        return 1
+    for label, first, last, writer in SPLICED_SPANS:
+        bad = reader.get(f"spliced_{label}_mismatched")
         if bad:
-            print(f"FAIL: {what}: {len(bad)} (layer, block) pairs hold the "
-                  f"wrong bytes, e.g. {bad[:5]}")
+            print(f"FAIL: the spliced window's {label} span (blocks {first}-"
+                  f"{last - 1}) does not hold node {writer}'s bytes: "
+                  f"{len(bad)} (layer, block) pairs, e.g. {bad[:5]}")
             return 1
 
-    print(f"PASS: node 1 pulled {NUM_REQUEST_BLOCKS} blocks off node 0 over "
-          f"{route} and every (layer, block) matched byte for byte, twice — the "
-          f"second GET crossed again and returned the identical bytes")
+    print(f"PASS: node 1 pulled {NUM_REQUEST_BLOCKS} blocks off node 0 byte for "
+          f"byte, and on a second window a four-way splice put local CPU / peer "
+          f"CPU / local SSD / peer SSD blocks "
+          f"({' / '.join(str(last - first) for _, first, last, _ in SPLICED_SPANS)}"
+          f") each at the right GPU offset")
     return 0
 
 

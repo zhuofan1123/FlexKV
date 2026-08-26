@@ -60,6 +60,7 @@
 #   RDMA_DEV=<first ACTIVE>  ETCD_PORT=<free>  REDIS_PORT=<free>
 #   PROTOCOL=rdma            # mooncake data-plane protocol: rdma | tcp
 #   OUTPUT_CHECK=strict      # peer-KV vs local-KV check: strict | warn | off
+#   RHT_SLOTS=4              # RHT slots per bucket: 1 | 2 | 4 | 8
 #
 # THE DEFAULT RUN COVERS BOTH TIERS, AND AIMS PHASE 2 AT THE PEER'S SSD:
 #   Each tier rendezvouses in its own etcd namespace, so a node running CPU + SSD
@@ -107,6 +108,11 @@ PROTOCOL="${PROTOCOL:-rdma}"
 # hosts whose two node halves are not kernel-identical (mixed GPU models), where
 # even correct bytes can decode differently -- and off skips the comparison.
 OUTPUT_CHECK="${OUTPUT_CHECK:-strict}"
+# RHT slots per bucket. At shmradix's default of 1 a bucket write is a blind
+# overwrite, so a reader that holds part of the prefix republishes itself over the
+# peer's entry and no peer stays routable. This run survives 1 only because
+# phase 2's reader holds none of it -- production does not, so mirror production.
+RHT_SLOTS="${RHT_SLOTS:-4}"
 # Hit-ratio logs are emitted every N requests per engine. Each engine sees
 # NUM_PROMPTS/DP requests per phase, so this makes the last window per engine
 # contain phase-2 requests only -- otherwise it straddles both phases and
@@ -120,6 +126,12 @@ ETCD_PID=""; REDIS_PID=""
 # (flexkv/common/config.py:876), and the eviction workload needs the headroom too.
 (( SSD_CACHE_GB == 0 || SSD_CACHE_GB > CPU_CACHE_GB )) || \
   { echo "[xnode] ERROR: SSD_CACHE_GB=$SSD_CACHE_GB must exceed CPU_CACHE_GB=$CPU_CACHE_GB"; exit 2; }
+# shmradix takes anything else back to 1 with only a WARN on rank 0's stderr, so
+# catch it here rather than let the run quietly lose cross-node reuse.
+case "$RHT_SLOTS" in
+  1|2|4|8) ;;
+  *) echo "[xnode] ERROR: RHT_SLOTS=$RHT_SLOTS must be 1, 2, 4 or 8"; exit 2 ;;
+esac
 CONF_DIR="$LOG_DIR/conf"
 
 log() { echo "[xnode] $*"; }
@@ -196,7 +208,10 @@ cleanup() {
   # 6) the etcd + redis this run started, last so the engines are gone before
   #    their rendezvous and address book disappear. Both are private to the run,
   #    so their whole state goes with them -- no per-key deletion needed.
-  for p in "$ETCD_PID" "$REDIS_PID"; do [[ -n "$p" ]] && kill -9 "$p" 2>/dev/null; done
+  # `wait` reaps them here, so bash does not print its own "Killed" job notice.
+  for p in "$ETCD_PID" "$REDIS_PID"; do
+    [[ -n "$p" ]] && { kill -9 "$p" 2>/dev/null; wait "$p" 2>/dev/null; }
+  done
   rm -rf "$LOG_DIR/etcd.data" 2>/dev/null
   log "GPU mem after cleanup: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null | tr '\n' ' ')"
   log "logs kept in $LOG_DIR"
@@ -320,7 +335,8 @@ pkill -9 nvidia-cuda-mps 2>/dev/null
 # ---------------- launch 2 nodes x DP engines ----------------
 # Shared by all engines: SHMRADIX_CLUSTER_ID, the base of the etcd namespaces they
 # meet in -- FlexKV appends the tier (radix/<id>_cpu/, radix/<id>_ssd/) so a node's
-# tiers cannot overwrite each other's peer entry.
+# tiers cannot overwrite each other's peer entry -- and SHMRADIX_RHT_SLOTS, which
+# rank 0's value settles cluster-wide anyway.
 # Distinct per node: FLEXKV_SHM_RADIX_ID (names its shm regions),
 # SHMRADIX_NODE_NAME (its etcd identity, which would otherwise come from the bind
 # IP both nodes share), the TE ipc endpoint (and the gpu_register port derived
@@ -333,6 +349,7 @@ export FLEXKV_RADIX_SHMEM=1 \
        FLEXKV_RADIX_WORLD_SIZE="$NODES" \
        FLEXKV_RADIX_REGISTRY="$ETCD" \
        SHMRADIX_CLUSTER_ID="$SHM_ID" \
+       SHMRADIX_RHT_SLOTS="$RHT_SLOTS" \
        FLEXKV_RADIX_RDMA_DEV="$RDMA_DEV" \
        FLEXKV_TRACE_RADIX_PEER=1 \
        FLEXKV_DP_SIZE="$DP" \

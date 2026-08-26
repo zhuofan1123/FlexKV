@@ -2712,8 +2712,11 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             return old_value
 
     def shutdown(self):
-        self.zmq_server.shutdown()
-        self.zmq_client.shutdown()
+        # The zmq pair and the staging buffer only exist on the p2p SSD path;
+        # a cpu-only peer worker never created them.
+        if self.cache_config.enable_p2p_ssd:
+            self.zmq_server.shutdown()
+            self.zmq_client.shutdown()
         # unregist buffer in mooncake engine
         self.mooncake_transfer_engine.unregist_buffer(self.cpu_blocks.data_ptr())
         if self.cache_config.enable_p2p_ssd:

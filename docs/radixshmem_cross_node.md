@@ -117,12 +117,21 @@ source /path/to/venv/bin/activate
 
 ```bash
 export FLEXKV_RADIX_SHMEM=1
-export FLEXKV_RADIX_WORLD_SIZE=4                     # 实际节点数，必须精确
+export FLEXKV_RADIX_WORLD_SIZE=2                     # 实际节点数，必须精确
 export FLEXKV_RADIX_REGISTRY=etcd://10.0.0.1:2379    # 同一个 etcd
+
+export SHMRADIX_RHT_SLOTS=4                          # RHT 每个桶的槽位数，只接受 1/2/4/8（别的值会退回 1）
+                                                     # 默认值是 1，而 1 跨节点复用直接失效，必须显式设置
 export SHMRADIX_CLUSTER_ID=flexkv                    # etcd 命名空间的前缀，不设时是 default；FlexKV 按层
-                                                     # 拼成 <前缀>_cpu / <前缀>_ssd，各层互不干扰；
-                                                     # 同一个 etcd 上跑多套集群必须各起一个名字；同一个 etcd 下仅一个集群时，可以不设
+ # 拼成 <前缀>_cpu / <前缀>_ssd，各层互不干扰；
+ # 同一个 etcd 上跑多套集群必须各起一个名字；同一个 etcd 下仅一个集群时，可以不设
 ```
+
+**`SHMRADIX_RHT_SLOTS` 不能是 1。** RHT 是「哪个节点持有这段前缀」的路由表，一个桶只有一格时写入
+是无条件盲写：reader 每次本地命中都会把自己 republish 进同一个桶，顺手把 peer 的条目抹掉，之后它
+永远只看到自己，`peer_hit` 恒为 0。≥ 2 之后写入改成先读桶再挑格子，reader 自己最多占一格，总有一
+格留给别人。继续往上加不是为了装下所有副本（一次查询只会挑一个 peer 走），而是让「哪个 peer 的前
+缀最长」判断得更准：节点数多、同一段前缀被很多节点同时持有时可以用 8。
 
 每节点不同：
 
@@ -379,7 +388,7 @@ grep -E "PEER(H2H|SSD2H) transfer request" vllm.log | tail -3
 
 | 文件                                  | 覆盖什么                                                       |
 |-------------------------------------|------------------------------------------------------------|
-| `tests/test_e2e_radix_peer_data.py` | per-(layer, block) 的**字节级**比对：peer 搬过来的 KV 与源节点的原始 KV 完全一致 |
+| `tests/test_e2e_radix_peer_data.py` | per-(layer, block) 的**字节级**比对：整段从 peer 取，一次 GET 拼出 local CPU / peer CPU / local SSD / peer SSD 四段。 |
 | `tests/test_radix_shmem_engine.py`  | 2-rank 的 engine 级单测（match / GET 规划 / rank 语义）              |
 
 ---
@@ -394,7 +403,7 @@ grep -E "PEER(H2H|SSD2H) transfer request" vllm.log | tail -3
 | `the installed shmradix extension was built without RDMA`                      | shmradix 编的时候没开 `ENABLE_RDMA`（§2.1）                                                                                                                                                                  |
 | bootstrap 直接失败，日志提示 registry                                                   | `FLEXKV_RADIX_REGISTRY` 没设或 etcd 连不上；或 shmradix 没开 `ENABLE_ETCD`                                                                                                                                     |
 | transfer worker `exitcode=-6` + `Unable to find metadata storage plugin redis` | mooncake 不是 `-DUSE_REDIS=ON` 编的（§2.2）                                                                                                                                                                |
-| bootstrap 成功但 `peer_hit` 恒为 0                                                  | 等得不够久（异步 PUT 还没落地），或两节点不在同一 etcd 命名空间（`SHMRADIX_CLUSTER_ID` 这个前缀必须全 cluster 一致）                                                                                                                      |
+| bootstrap 成功但 `peer_hit` 恒为 0                                                  | `SHMRADIX_RHT_SLOTS` 没设，默认 1 的桶被 reader 自己的 republish 盲写掉（§3.1）；或等得不够久（异步 PUT 还没落地）；或两节点不在同一 etcd 命名空间（`SHMRADIX_CLUSTER_ID` 这个前缀必须全 cluster 一致）                                                    |
 | `peer_hit > 0` 但传输日志里 `bytes=0`                                                | 数据面没通：mooncake config 的 IP / device_name / metadata backend，或 Redis 通讯录                                                                                                                              |
 | 某条请求发出去再也不返回（客户端超时，服务端不报错）                                                     | 某个 peer 传输 op 失败了，而 FlexKV 没有 graph 级别的 abort/timeout，那条请求就一直挂着。日志里找 zmq notify 超时和 mooncake 的握手重试；网卡不干净时可以先用 `PROTOCOL=tcp` 排除数据面                                                                   |
 | 搬过来的 KV 解码出乱码                                                                  | block 字节布局不一致（模型 / `tokens_per_block` / KV dtype 各节点必须一样），或 Redis 被别的部署共用（§3.4 第一条）                                                                                                                  |
