@@ -43,9 +43,9 @@ CPU 甚至不参与。远程 walk 的传输方式由 `FLEXKV_RADIX_REMOTE_OP_TRA
 **数据面（再把 KV 字节搬过来）**
 
 控制面返回的 `remote_node_id`（= 对端的 cluster rank）就是数据面要寻址的 node id。FlexKV
-用 mooncake 从对端节点读那些 block：CPU 里的走 `PEERH2H`，SSD 上的走 `PEERSSD2H`。mooncake
-通过 Redis 中的 `meta:<node_id>` 查询对端的 mooncake / zmq 地址 + buffer 基址，
-Redis 的 `node:<node_id>` 存存活 TTL。
+用 mooncake 从对端节点读那些 block：CPU 里的走 `PEERH2H`，SSD 上的走 `PEERSSD2H`。对端的
+mooncake / zmq 地址和 buffer 基址，FlexKV 从 Redis 的 `meta:<node_id>` 取（`node:<node_id>`
+存存活 TTL），再交给 mooncake 去拉。
 
 每一层（CPU / SSD）各有自己的树，各自在 etcd 的**独立命名空间**（`radix/<cluster_id>_cpu/`、
 `radix/<cluster_id>_ssd/`）里报到、各自领 rank；同一个节点的各层用的是**同一个节点身份**
@@ -55,7 +55,23 @@ Redis 的 `node:<node_id>` 存存活 TTL。
 
 ## 2. 安装
 
-一共五样东西：
+### 2.0 系统依赖
+
+`install.sh` 只装 FlexKV 和 mooncake 自己那一步要的包，shmradix 的编译依赖、etcd 和 redis 的
+服务端都得先自己装（Ubuntu / Debian）：
+
+```bash
+# shmradix 编译要的；跨节点还要 libibverbs（RDMA）和 Go toolchain（它的 etcd client 是 Go 写的）
+apt-get update && apt-get install -y \
+    cmake build-essential libxxhash-dev liburing-dev libibverbs-dev golang-go
+pip install pybind11
+
+# 两个服务端：etcd 管启动时的成员表，redis 管数据面通讯录（起法见 §3.3）
+apt-get install -y etcd-server etcd-client redis-server
+```
+
+用到的只是 etcd 的 v3 API，本文验证的是官方 release 的 3.5；`etcd-client`
+给的是排错用的 `etcdctl`（§5）。
 
 ### 2.1 shmradix：必须带 RDMA + etcd
 
@@ -65,134 +81,29 @@ Redis 的 `node:<node_id>` 存存活 TTL。
 ```bash
 git clone -b dev ssh://git@gitlab-master.nvidia.com:12051/haoxu/radixshmem.git
 cd radixshmem
-# 系统依赖：libxxhash-dev、liburing-dev、cmake、pybind11
-#   跨节点还要：libibverbs-dev（RDMA）、Go toolchain（etcd client 是 Go 写的）
-mkdir build && cd build
-cmake .. -DENABLE_RDMA=ON -DENABLE_ETCD=ON && make -j
-# Python binding（产物：python/shmradix/_core.cpython-3xx-x86_64-linux-gnu.so）
-cd ../python && pip install -e . --no-build-isolation
+pip install -e python --no-build-isolation
 ```
 
-三个构建开关（默认全 ON，单机时都可以关）的含义：
+### 2.2 FlexKV（带 mooncake）
 
-| 开关                | 依赖                                 | 关掉的后果                                                       |
-|-------------------|------------------------------------|-------------------------------------------------------------|
-| `ENABLE_RDMA`     | libibverbs                         | **没有跨节点**：region 只能是单机的，`is_distributed()` 恒假               |
-| `ENABLE_ETCD`     | Go toolchain                       | **没有 cluster bootstrap**，跨节点这条路整条不存在                        |
-| `ENABLE_MOONCAKE` | Mooncake 头 + 库（`-DMOONCAKE_ROOT=`） | 关掉 shmradix 自带的数据面。FlexKV 用自己的 PEERH2H / PEERSSD2H，**不需要它** |
-
-### 2.2 FlexKV
+`install.sh` 默认就开 P2P（`--enable-p2p`），跨节点要的三样它一起装完：FlexKV 本体、从源码编
+的 mooncake、python 的 `redis` 客户端。
 
 ```bash
 cd FlexKV
-pip install -e . --no-build-isolation
+bash install.sh --venv /path/to/venv    # 该目录已经是个 venv 就直接复用，不会重建
+source /path/to/venv/bin/activate
 ```
 
-依赖：Cython（构建时）、torch、numpy、xxhash、liburing、expiring_dict、zmq、redis 等，详见
-`requirements.txt`。运行时把两个库都放进 path：
-
-```bash
-export PYTHONPATH=/work/FlexKV:/work/radixshmem/python:$PYTHONPATH
-export LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/torch/lib:$LD_LIBRARY_PATH
-```
-
-### 2.3 mooncake：必须装
-
-单机模式完全不需要 mooncake；跨节点的**数据面**靠它搬 KV 字节。装是一行：
-
-```bash
-pip install mooncake-transfer-engine
-```
-
-但**光装上不一定够用**。mooncake 自己需要一个 metadata server 来交换 segment descriptor
-（谁的哪块内存、rkey 多少），而 **PyPI 上的 wheel 是 `USE_REDIS=OFF` 编的**，只有
-`P2PHANDSHAKE` 和 `http` 两个 plugin。§3.2 的模板写的是 `metadata_backend: "redis"`，配了它
-而 plugin 不在，就会 `Unable to find metadata storage plugin redis` 然后 abort —— 表现是
-FlexKV 的 transfer worker 进程 `exitcode=-6`。
-
-先确认手里这份带不带：
-
-```bash
-SP=$(python -c 'import mooncake,os;print(os.path.dirname(mooncake.__file__))')
-strings "$SP/engine.so" | grep -c RedisStoragePlugin   # >0 = 带 redis plugin；官方 wheel 是 0
-```
-
-**方案 A（不重编，最省事）**：把 mooncake 的 metadata 后端换成 http —— wheel 是
-`USE_HTTP=ON` 编的，服务端也自带：
-
-```bash
-python -m mooncake.http_metadata_server --port 8080 &   # 集群里起一个，所有节点都指它
-```
-
-然后每个节点的 mooncake config 写 `"metadata_backend": "http"` +
-`"metadata_server": "http://<那台机器>:8080/metadata"`。
-
-**注意这只换 mooncake 自己的 metadata 通道**，跟 FlexKV 的 `meta:<node_id>` 通讯录是两回事
-—— §2.5 那个 Redis 仍然必需。两者可以是两个不同的实例
-（`scripts/multi-nodes/start_multi_node_serving.sh` 就是 6379 给 FlexKV、6380 给 mooncake）。
-
-**方案 B（源码重编，本文实测的路子）**：只重编 transfer engine 的 pybind 模块
-（`engine` target），把产物换进已装好的 wheel 目录：
-
-```bash
-# 1. 版本跟已装的 wheel 对齐（这里 wheel 0.3.11.post1 <-> tag v0.3.11）
-pip show mooncake-transfer-engine | grep -i version
-git clone https://github.com/kvcache-ai/Mooncake.git /tmp/Mooncake
-cd /tmp/Mooncake && git checkout v0.3.11 && git submodule update --init --recursive
-
-# 2. 系统依赖。关键是 libhiredis-dev —— redis plugin 靠它，缺了 import 就报 undefined symbol
-apt-get install -y build-essential cmake ninja-build pkg-config patchelf \
-    libibverbs-dev libgoogle-glog-dev libjsoncpp-dev libcurl4-openssl-dev \
-    libhiredis-dev libnuma-dev libpython3-dev libssl-dev libunwind-dev libasio-dev
-
-# 3. yalantinglibs 是 CMake 的 REQUIRED 依赖，从 submodule 装
-cmake -S extern/yalantinglibs -B /tmp/ylt-build \
-      -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
-cmake --build /tmp/ylt-build -j && cmake --install /tmp/ylt-build
-#    （懒人版：bash dependencies.sh，把 2+3 一起做掉，耗时更长）
-
-# 4. 只编 engine target；store / etcd / cuda 这几块 FlexKV 不用，全关掉省时间
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-      -DUSE_REDIS=ON -DUSE_HTTP=ON \
-      -DUSE_ETCD=OFF -DWITH_STORE=OFF -DUSE_CUDA=OFF
-cmake --build build --target engine -j
-
-# 5. 替换 wheel 里的 engine.so（先备份官方版）
-SP=$(python -c 'import mooncake,os;print(os.path.dirname(mooncake.__file__))')
-cp -n "$SP/engine.so" "$SP/engine.so.wheel-bak"
-cp build/mooncake-integration/engine.cpython-*-x86_64-linux-gnu.so "$SP/engine.so"
-```
-
-只换这一个文件就够，不需要重打 wheel。验证：
-
-```bash
-strings "$SP/engine.so" | grep -c RedisStoragePlugin   # 现在应该 >0
-ldd "$SP/engine.so" | grep hiredis                     # 能解析到 libhiredis.so.1
-python -c "import mooncake.engine; print('ok')"
-```
-
-### 2.4 etcd
-
-所有节点连同一个 etcd 即可（不需要每节点一个）。它只在启动阶段用一次。
-
-单节点 etcd（测试足够）：
-
-```bash
-etcd --name t --data-dir /tmp/flexkv_etcd.etcd \
-     --listen-client-urls http://0.0.0.0:2379 \
-     --advertise-client-urls http://10.0.0.1:2379 \
-     --listen-peer-urls http://0.0.0.0:2380 \
-     --initial-advertise-peer-urls http://10.0.0.1:2380 \
-     --initial-cluster t=http://10.0.0.1:2380 &
-```
-
-`FLEXKV_RADIX_REGISTRY` 写 `etcd://10.0.0.1:2379` 或 `http://10.0.0.1:2379` 都认（scheme
-会被剥掉）。
-
-### 2.5 Redis：必须是这个 cluster 独占的
-
-数据面的通讯录，装个普通 `redis-server` 就行，但**不能跟别的 FlexKV 部署共用**，原因见
-§3.4 第一条。
+- 想装进当前环境用 `--no-venv`。torch 缺了它会自己
+  `pip install torch`，**要挑 CUDA 版本就先自己把 torch 装好**。
+- 干净机器上别加 `--skip-deps`：这个开关同时跳过 FlexKV 和 mooncake 两边的系统依赖
+  （`libhiredis-dev`、`libibverbs-dev`、`liburing-dev` 等），mooncake 那步会直接在 cmake 阶段挂掉。
+- 它会在仓库里留下 `.mooncake-build/`（mooncake 源码加构建产物，接近 1 GB）。重跑会复用这个
+  目录，不用删。
+- mooncake 必须是这样源码编出来的：**PyPI 上的 wheel 是 `USE_REDIS=OFF` 编的**，没有 redis
+  metadata plugin，而 §3.2 的模板走 `metadata_backend: "redis"` —— 缺了这个 plugin，FlexKV 的
+  transfer worker 起手就 abort（`Unable to find metadata storage plugin redis`，`exitcode=-6`）。
 
 ---
 
@@ -277,15 +188,14 @@ export FLEXKV_SHM_RADIX_ID=node2               # shm region 名 + TE channel 名
 - 各节点的 `cpu_cache_gb` 可以不同（容量不必对齐），但**block 的字节布局必须一样**：
   同一个模型、同样的 `tokens_per_block`、同样的 KV dtype。最省心的做法是所有节点配成一样
 
-对应的 mooncake 配置（每节点一份，`engine_ip` 填本机 IP、`device_name` 填本机网卡；
-`metadata_backend` 选 `redis` 还是 `http` 取决于 §2.3 走的哪条路）：
+对应的 mooncake 配置（每节点一份，`engine_ip` 填本机 IP、`device_name` 填本机网卡）：
 
 ```json
 {
   "engine_ip": "10.0.0.12",
   "engine_port": 12345,
   "metadata_backend": "redis",
-  "metadata_server": "redis://10.0.0.1:6380",
+  "metadata_server": "redis://10.0.0.1:6379",
   "metadata_server_auth": "",
   "protocol": "rdma",
   "device_name": "mlx5_0"
@@ -294,7 +204,39 @@ export FLEXKV_SHM_RADIX_ID=node2               # shm region 名 + TE channel 名
 
 ### 3.3 启动
 
-§2 的五样东西就位、环境变量按 §3.1 配好之后，每个节点起自己的 `vllm serve`：
+**先起 etcd 和 redis。** 两个都得自己起：FlexKV 和 mooncake 碰它们的都只是客户端
+（`flexkv.c_ext.RedisMetaChannel`、mooncake 的 redis plugin），谁都不会替你把服务端拉起来。
+各起一个、全 cluster 共用即可，不需要每节点一个。
+
+etcd 只在启动阶段用一次，单节点就够：
+
+```bash
+etcd --name t --data-dir /tmp/flexkv_etcd.etcd \
+     --listen-client-urls http://0.0.0.0:2379 \
+     --advertise-client-urls http://10.0.0.1:2379 \
+     --listen-peer-urls http://0.0.0.0:2380 \
+     --initial-advertise-peer-urls http://10.0.0.1:2380 \
+     --initial-cluster t=http://10.0.0.1:2380 &
+```
+
+`FLEXKV_RADIX_REGISTRY` 写 `etcd://10.0.0.1:2379` 或 `http://10.0.0.1:2379` 都认（scheme
+会被剥掉）。
+
+redis 有**两个**用户：FlexKV 的数据面通讯录（§1 那两个 `meta:` / `node:` 键，地址来自 §3.2 的
+`redis_host` / `redis_port`）和 mooncake 自己的 metadata 通道（`metadata_server`，交换 segment
+descriptor 用）。两者共用一个实例就行，键名不撞（§3.2 的模板就是共用；
+`scripts/multi-nodes/start_multi_node_serving.sh` 则是 6379 / 6380 分开两个）。mooncake 这一侧
+甚至可以不要 redis（`metadata_backend` 换 `http` 或 `P2PHANDSHAKE`），FlexKV 那一侧省不掉。
+
+```bash
+redis-server --port 6379 --bind 0.0.0.0 \
+             --save '' --appendonly no --daemonize yes   # 通讯录是临时数据，不用落盘
+```
+
+这个 redis **不能跟别的 FlexKV 部署共用**，原因见 §3.4 第一条。
+
+**再起引擎。** §2 装好、环境变量按 §3.1 配好、JSON 按 §3.2 写好之后，每个节点起自己的
+`vllm serve`：
 
 ```bash
 vllm serve <model_path> \
@@ -324,13 +266,12 @@ vllm serve <model_path> \
 
 ### 3.4 注意事项与限制
 
-- ** FlexKV拉起的Redis 必须由这一个 cluster 独占。因为 cluster rank 直接当 node_id 用，而别的
+- ** FlexKV使用的Redis 必须由这一个 cluster 独占。因为 cluster rank 直接当 node_id 用，而别的
   FlexKV 部署的 node_id 是从 1 开始递增分配的，撞上 rank 1,2,3 是常态。**撞了不会报错**：
   注册是无条件覆盖，而 `meta:` 里存的是对端 CPU buffer 的基址，于是 peer read 会读到另一个
   部署的内存。
 - GET 是本地和 peer 的组合匹配，如果 peer 可以延长同一前缀，会从一个 peer 上读取尾部的部分。取KV的顺序是本地 CPU → peer
-  CPU →
-  本地 SSD → peer SSD。
+  CPU → 本地 SSD → peer SSD。
 - **各层的 rank 必须一致**：正常都会分到同一个 rank，不一致时 FlexKV 报错退出（一个 node id
   必须能代表所有层）。
 - **不能和 `enable_remote`（PCFS 那一层第三方存储）同时开**，`KVManager` 会直接报错：那一层
@@ -352,7 +293,7 @@ vllm serve <model_path> \
 的 prompt 只发给节点 1，检查节点 1 有没有真的把节点 0 算好的 KV 从网络上拿过来复用、而且
 拿到的字节是对的。**
 
-脚本自己会把下面这一整套拉起来（包含一个私有 redis），跑完自动清干净：
+脚本自己会把下面这一整套拉起来，跑完自动清干净：
 
 ```
    节点 0（radix rank 0）  :31000       节点 1（radix rank 1）  :31001
@@ -383,9 +324,10 @@ vllm serve <model_path> \
   `/root/vllm-env`），且 vllm 里注册了 `FlexKVConnectorV1`
 - GPU 数 ≥ 2 × DP（默认 DP=4 → 要 8 卡；卡少就 `DP=2` / `DP=1`）
 - 一个带 ACTIVE 口的 RDMA 设备：控制面的硬要求，默认也是数据面（`PROTOCOL=rdma`）走的路
-- 一个连得上的 etcd（`ETCD=`，默认 `http://127.0.0.1:2379`；起法见 §2.4）
-- PATH 上有 `redis-server`（脚本起一个私有实例，退出时杀掉）
-- mooncake 带 redis metadata plugin（脚本写的是 `metadata_backend: redis`，装法见 §2.3）
+- PATH 上有 `etcd`、`redis-server`、`redis-cli`：脚本给这次运行**各起一个私有实例**（端口默认
+  随机取空闲的，可用 `ETCD_PORT=` / `REDIS_PORT=` 指定），退出时连进程带数据一起清掉 ——
+  这样别的运行留下的陈旧 peer 记录不可能混进来
+- mooncake 带 redis metadata plugin（脚本写的是 `metadata_backend: redis`，装法见 §2.2）
 - SSD 层的磁盘空间：脚本给两个节点各分一个 8 GB 的 ssd 目录（同一个目录会让它们互相写对方的
   block 文件），退出时删掉
 
@@ -408,7 +350,8 @@ OUTPUT_CHECK=warn bash scripts/run_shmradix_repro.sh    # 两半 GPU 型号不�
 **通过标准**：输出 `RESULT: PASS`。
 日志留在 `$LOG_DIR`（默认 `/tmp/flexkv-xnode-<pid>`）：`n0.log` / `n1.log` 是两个节点的 vllm
 全量日志，`all.log` 是合并版，`output_check.json` 是逐条输出对比。退出
-时脚本会清掉本次运行的所有进程、`/dev/shm`、自己在 etcd 里的 key、私有 redis 和 MPS daemon。
+时脚本会清掉本次运行的所有进程（含它起的 etcd / redis）、`/dev/shm`、etcd 数据目录和 MPS
+daemon。
 
 ### 4.2 在真正的多台机器上验证
 
@@ -450,7 +393,7 @@ grep -E "PEER(H2H|SSD2H) transfer request" vllm.log | tail -3
 | `cannot derive this node's radixshmem identity`                                | `world_size > 1`，但 `SHMRADIX_NODE_NAME` 和 `FLEXKV_RADIX_RPC_ADDRESS` / `_INTERFACE` 都没配（或网卡没有 IPv4），身份无从算起                                                                                           |
 | `the installed shmradix extension was built without RDMA`                      | shmradix 编的时候没开 `ENABLE_RDMA`（§2.1）                                                                                                                                                                  |
 | bootstrap 直接失败，日志提示 registry                                                   | `FLEXKV_RADIX_REGISTRY` 没设或 etcd 连不上；或 shmradix 没开 `ENABLE_ETCD`                                                                                                                                     |
-| transfer worker `exitcode=-6` + `Unable to find metadata storage plugin redis` | mooncake 不是 `-DUSE_REDIS=ON` 编的（§2.3）                                                                                                                                                                |
+| transfer worker `exitcode=-6` + `Unable to find metadata storage plugin redis` | mooncake 不是 `-DUSE_REDIS=ON` 编的（§2.2）                                                                                                                                                                |
 | bootstrap 成功但 `peer_hit` 恒为 0                                                  | 等得不够久（异步 PUT 还没落地），或两节点不在同一 etcd 命名空间（`SHMRADIX_CLUSTER_ID` 这个前缀必须全 cluster 一致）                                                                                                                      |
 | `peer_hit > 0` 但传输日志里 `bytes=0`                                                | 数据面没通：mooncake config 的 IP / device_name / metadata backend，或 Redis 通讯录                                                                                                                              |
 | 某条请求发出去再也不返回（客户端超时，服务端不报错）                                                     | 某个 peer 传输 op 失败了，而 FlexKV 没有 graph 级别的 abort/timeout，那条请求就一直挂着。日志里找 zmq notify 超时和 mooncake 的握手重试；网卡不干净时可以先用 `PROTOCOL=tcp` 排除数据面                                                                   |

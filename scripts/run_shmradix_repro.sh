@@ -57,7 +57,7 @@
 #   VENV=/root/vllm-env  MODEL=Qwen/Qwen3-0.6B  PORT_BASE=31000  DP=4
 #   CPU_CACHE_GB=1  SSD_CACHE_GB=8  FLOOD_PROMPTS=40  NUM_PROMPTS=8  HIT_MIN=50
 #   SHM_ID=xnode_<pid>  LOG_DIR=/tmp/flexkv-xnode-<pid>  READY_TIMEOUT=900
-#   ETCD=http://127.0.0.1:2379  RDMA_DEV=<first ACTIVE>  REDIS_PORT=<free>
+#   RDMA_DEV=<first ACTIVE>  ETCD_PORT=<free>  REDIS_PORT=<free>
 #   PROTOCOL=rdma            # mooncake data-plane protocol: rdma | tcp
 #   OUTPUT_CHECK=strict      # peer-KV vs local-KV check: strict | warn | off
 #
@@ -101,7 +101,6 @@ READY_TIMEOUT="${READY_TIMEOUT:-900}"
 LOG_DIR="${LOG_DIR:-/tmp/flexkv-xnode-$$}"
 NUM_PROMPTS="${NUM_PROMPTS:-8}"
 HIT_MIN="${HIT_MIN:-50}"
-ETCD="${ETCD:-http://127.0.0.1:2379}"
 PROTOCOL="${PROTOCOL:-rdma}"
 # How to treat a phase-2 (peer KV) completion that differs from its phase-3 (local
 # KV) counterpart: strict fails the run, warn reports it and keeps going -- for
@@ -116,15 +115,34 @@ LOG_INTERVAL=$(( NUM_PROMPTS / DP )); (( LOG_INTERVAL > 0 )) || LOG_INTERVAL=1
 
 TOTAL=$(( NODES * DP ))   # engines overall; API ports are one per NODE
 PIDS=(); PGIDS=()
+ETCD_PID=""; REDIS_PID=""
 # CacheConfig rejects an SSD tier that is not strictly larger than the CPU one
 # (flexkv/common/config.py:876), and the eviction workload needs the headroom too.
 (( SSD_CACHE_GB == 0 || SSD_CACHE_GB > CPU_CACHE_GB )) || \
   { echo "[xnode] ERROR: SSD_CACHE_GB=$SSD_CACHE_GB must exceed CPU_CACHE_GB=$CPU_CACHE_GB"; exit 2; }
-REDIS_PID=""
 CONF_DIR="$LOG_DIR/conf"
 
 log() { echo "[xnode] $*"; }
 die() { log "ERROR: $*"; exit 2; }
+
+free_port_block() { python - "$1" <<'PY'
+import socket, sys
+n = int(sys.argv[1])
+for _ in range(64):
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); base = s.getsockname()[1]; s.close()
+    held = []
+    try:
+        for off in range(n):
+            k = socket.socket(); k.bind(("127.0.0.1", base + off)); held.append(k)
+        print(base); break
+    except OSError:
+        continue
+    finally:
+        for k in held: k.close()
+else:
+    raise SystemExit("no free port block")
+PY
+}
 
 # --- kill engine/TE procs orphaned by THIS run (the pgid kill in cleanup() only
 #     reaches processes that stayed in the launched groups; /proc scan => no pgrep
@@ -147,7 +165,7 @@ reap_run_procs() {
 }
 
 cleanup() {
-  local rc=$? g i tier
+  local rc=$? g i p
   trap - EXIT INT TERM          # disarm to avoid re-entry
   echo; log "=== graceful cleanup ==="
   # 1) the vLLM process groups: SIGTERM, wait, then SIGKILL
@@ -175,15 +193,11 @@ cleanup() {
   rm -f /dev/shm/*flexkv* /dev/shm/*shmradix* /dev/shm/*"${SHM_ID}"* 2>/dev/null
   rm -f /tmp/flexkv_"${SHM_ID}"* 2>/dev/null
   rm -rf "$LOG_DIR"/ssd_r* 2>/dev/null
-  # 6) our private redis, and this cluster's etcd rendezvous keys. shmradix roots
-  #    them at "radix/<cluster_id>/", and FlexKV gives each tier its own cluster_id
-  #    ("<SHMRADIX_CLUSTER_ID>_<tier>"), so every tier needs deleting.
-  [[ -n "$REDIS_PID" ]] && kill -9 "$REDIS_PID" 2>/dev/null
-  if command -v etcdctl >/dev/null 2>&1; then
-    for tier in cpu ssd remote; do
-      ETCDCTL_API=3 etcdctl --endpoints="$ETCD" del --prefix "radix/${SHM_ID}_${tier}/" >/dev/null 2>&1
-    done
-  fi
+  # 6) the etcd + redis this run started, last so the engines are gone before
+  #    their rendezvous and address book disappear. Both are private to the run,
+  #    so their whole state goes with them -- no per-key deletion needed.
+  for p in "$ETCD_PID" "$REDIS_PID"; do [[ -n "$p" ]] && kill -9 "$p" 2>/dev/null; done
+  rm -rf "$LOG_DIR/etcd.data" 2>/dev/null
   log "GPU mem after cleanup: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null | tr '\n' ' ')"
   log "logs kept in $LOG_DIR"
   log "cleanup done (exit $rc)"
@@ -224,14 +238,33 @@ fi
 [[ -n "${RDMA_DEV:-}" ]] || die "no RDMA device with an ACTIVE port (cross-node needs one; set RDMA_DEV= to force)"
 log "RDMA device: $RDMA_DEV  gid_idx=${FLEXKV_RADIX_GID_IDX:-3}"
 
+# ---------------- private etcd (cluster rendezvous) ----------------
+# Started here rather than shared, so a leftover peer entry from another run can
+# never join this cluster: the state dies with the instance.
+command -v etcd >/dev/null 2>&1 || die "etcd not on PATH (world_size>1 bootstrap rendezvouses through it)"
+ETCD_PORT="${ETCD_PORT:-$(free_port_block 2)}" || die "no etcd port block"
+ETCD="http://127.0.0.1:$ETCD_PORT"
+ETCD_PEER="http://127.0.0.1:$(( ETCD_PORT + 1 ))"
+rm -rf "$LOG_DIR/etcd.data"
+etcd --name xnode --data-dir "$LOG_DIR/etcd.data" \
+  --listen-client-urls "$ETCD" --advertise-client-urls "$ETCD" \
+  --listen-peer-urls "$ETCD_PEER" --initial-advertise-peer-urls "$ETCD_PEER" \
+  --initial-cluster "xnode=$ETCD_PEER" >"$LOG_DIR/etcd.log" 2>&1 &
+ETCD_PID=$!
+for _ in $(seq 1 30); do
+  curl -s --max-time 2 "$ETCD/version" >/dev/null 2>&1 && break; sleep 1
+done
 curl -s --max-time 5 "$ETCD/version" >/dev/null 2>&1 \
-  || die "no etcd at $ETCD (world_size>1 bootstrap rendezvouses through it)"
-log "etcd: $(curl -s --max-time 5 "$ETCD/version")"
-
-command -v redis-server >/dev/null 2>&1 || die "redis-server not on PATH (peer data-plane address book)"
+  || { tail -20 "$LOG_DIR/etcd.log"; die "etcd did not come up on $ETCD"; }
+log "etcd ready on $ETCD (pid $ETCD_PID): $(curl -s --max-time 5 "$ETCD/version")"
 
 # ---------------- private redis (address book + mooncake metadata) ----------------
-REDIS_PORT="${REDIS_PORT:-$(python -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')}"
+# Carries both FlexKV's meta:/node: keys and mooncake's metadata channel; private
+# for the same reason as etcd -- a stale peer address there points the data plane
+# at a dead buffer.
+command -v redis-server >/dev/null 2>&1 && command -v redis-cli >/dev/null 2>&1 \
+  || die "redis-server / redis-cli not on PATH (peer data-plane address book)"
+REDIS_PORT="${REDIS_PORT:-$(free_port_block 1)}" || die "no free redis port"
 redis-server --port "$REDIS_PORT" --save '' --appendonly no --daemonize no \
   --bind 127.0.0.1 >"$LOG_DIR/redis.log" 2>&1 &
 REDIS_PID=$!
@@ -248,24 +281,6 @@ log "redis ready on 127.0.0.1:$REDIS_PORT (pid $REDIS_PID)"
 # load_user_config_from_file + update_default_config_from_user_config copies
 # them into CacheConfig (config.py:1201-1215). That is the only way to open the
 # peer data plane through vLLM.
-free_port_block() { python - "$1" <<'PY'
-import socket, sys
-n = int(sys.argv[1])
-for _ in range(64):
-    s = socket.socket(); s.bind(("127.0.0.1", 0)); base = s.getsockname()[1]; s.close()
-    held = []
-    try:
-        for off in range(n):
-            k = socket.socket(); k.bind(("127.0.0.1", base + off)); held.append(k)
-        print(base); break
-    except OSError:
-        continue
-    finally:
-        for k in held: k.close()
-else:
-    raise SystemExit("no free port block")
-PY
-}
 ZMQ_BASE=$(free_port_block $(( NODES * 4 ))) || die "no zmq port block"
 for ((R=0; R<NODES; R++)); do
   MC_PORT=$(free_port_block 1)

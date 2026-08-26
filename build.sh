@@ -115,17 +115,6 @@ fi
 echo "=== Build and installation completed successfully in ${BUILD_TYPE} mode ==="
 echo "You can now run tests directly without setting LD_LIBRARY_PATH manually"
 
-# === Install bundled radixshmem (shmradix) wheel, if present ===
-SHMRADIX_WHEEL=$(ls "$PROJECT_ROOT"/radixshmem/shmradix-*.whl 2>/dev/null | head -n 1)
-if [ -n "$SHMRADIX_WHEEL" ]; then
-    echo "=== Installing bundled radixshmem wheel: $(basename "$SHMRADIX_WHEEL") ==="
-    pip install --no-deps --force-reinstall "$SHMRADIX_WHEEL" \
-        && python3 -c "import shmradix; print('shmradix OK:', shmradix.__file__)" \
-        || echo "Warning: shmradix wheel install/import failed (radix-shmem mode will error)"
-else
-    echo "=== No radixshmem/shmradix-*.whl found; skipping (radix-shmem mode unavailable) ==="
-fi
-
 if [ "$BUILD_TYPE" = "debug" ]; then
   FLEXKV_DEBUG=1 pip install -v --no-build-isolation -e .
 elif [ "$BUILD_TYPE" = "release" ]; then
