@@ -2,39 +2,42 @@
 """
 Bootstrap for radixshmem-backed CacheEngine.
 
-Per-device-type RadixTree (CPU / SSD / REMOTE) lives in its own POSIX shm
+Per-device-type RadixTree (CPU / SSD) lives in its own POSIX shm
 region. The first DP process (instance 0, dp_client_id 0) creates the regions
-via `shmradix.RadixServer`; all others attach via `shmradix.RadixClient`.
+via `shmradix.RadixServer`; every other process attaches by name with
+`shmradix.RadixClient` (`attach_radix_client`, called from
+`CacheEngineRadixShmem`).
 
 Naming convention:
-    /flexkv_radix_{server_id}_{cpu|ssd|remote}[_r{rank}]
+    /shmradix_{shm_radix_id}_{cpu|ssd|remote}
 
-`server_id` defaults to a fixed token but is overridable so multiple FlexKV
-instances on the same host don't collide. The `_r{rank}` suffix is appended only
-when `world_size > 1`, so two simulated ranks can share one host without
-colliding. The name is purely LOCAL: peers exchange shm base address, rkey and
-segment offsets (and even each RHT shard's shm name) through the cluster
-manifest at bootstrap, so it never has to agree across ranks.
-
-In distributed mode `RadixServer` builds the name itself as
-`config.name + "_" + config.node_name`, so this module sets `node_name = r{rank}`
-to make the result deterministic — every DP process has to compute the same name
-to attach as a client, and only the bootstrap process holds the server object.
+`shm_radix_id` (FLEXKV_SHM_RADIX_ID, default `flexkv`) tells apart several
+FlexKV instances on one node. A distributed region appends this node's shmradix
+identity (`node_name_for`: SHMRADIX_NODE_NAME, else `node<bind-ip>`), which FlexKV
+resolves itself and passes to `RadixServerConfig.node_name` so `shm_name_for` is
+the one name both the owner and every attacher use.
 
 Cluster membership goes through etcd, which is shmradix's only bootstrap path in
-an RDMA build. Each tier bootstraps as an INDEPENDENT cluster (its own RHT and
-its own rank space), so each gets its own etcd sub-namespace. Cluster rank is an
-OUTPUT: etcd assigns dense ranks by sorted `/peers` key order, and callers read
-it back via `RadixServer.rank()` / `RadixClient.rank()` rather than assuming the
-configured `rank` survived.
+an RDMA build. Each tier rendezvouses in its OWN namespace (`cluster_id_for`),
+since a peer entry is keyed by node identity alone yet carries that tier's shm
+registration. The identity has to be unique per node, so nodes co-located on one
+host need a distinct bind IP (or a distinct `SHMRADIX_NODE_NAME`) AND a distinct
+FLEXKV_SHM_RADIX_ID for their local region and TE channel names.
+Cluster rank is an OUTPUT: etcd assigns dense ranks by sorted `/peers` key order,
+and callers read it back off `ShmRadixOwners.cluster_rank` (`RadixServer.rank()`)
+rather than configuring one.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
+import socket
+import struct
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Generator, Optional, Tuple
 
-from flexkv.common.config import CacheConfig, ModelConfig
+from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV, CacheConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.transfer import DeviceType
 
@@ -44,6 +47,10 @@ except ImportError:  # pragma: no cover
     shmradix = None
 
 
+_SHM_PREFIX = "/shmradix"
+
+_SIOCGIFADDR = 0x8915
+
 _DEVICE_KIND_NAMES = {
     DeviceType.CPU: "cpu",
     DeviceType.SSD: "ssd",
@@ -51,54 +58,107 @@ _DEVICE_KIND_NAMES = {
 }
 
 
-def shm_radix_prefix(device_type: DeviceType, server_id: str) -> str:
-    """The shm-name prefix shared by a region's owner and its clients.
+def _shm_base(device_type: DeviceType, shm_radix_id: str) -> str:
+    """Tier name without the node identity — what a distributed owner passes as
+    ``RadixServerConfig.name`` for ``bootstrap()`` to extend."""
+    return f"{_SHM_PREFIX}_{shm_radix_id}_{_DEVICE_KIND_NAMES[device_type]}"
 
-    In distributed mode ``RadixServer`` appends ``"_" + node_name`` to this
-    prefix itself, which is why the bootstrap hands it the bare prefix and sets
-    ``node_name`` to the deterministic label ``node_name_for`` returns.
+
+def _interface_ipv4(iface: str) -> str:
+    """IPv4 bound to ``iface``, or "" — mirrors shmradix's ``interface_ipv4``.
+
+    shmradix walks ``getifaddrs`` and takes the interface's first AF_INET address;
+    SIOCGIFADDR reports the same primary address.
     """
-    return f"/flexkv_radix_{server_id}_{_DEVICE_KIND_NAMES[device_type]}"
+    with contextlib.closing(socket.socket(socket.AF_INET,
+                                          socket.SOCK_DGRAM)) as sock:
+        try:
+            res = fcntl.ioctl(sock.fileno(), _SIOCGIFADDR,
+                              struct.pack("256s", iface.encode()[:15]))
+        except OSError:
+            return ""
+    return socket.inet_ntoa(res[20:24])
 
 
-def node_name_for(rank: int) -> str:
-    """This node's shmradix identity label.
+def resolve_bind_ip() -> str:
+    """Bind IP shmradix resolves for this node, or "" if it resolves none.
 
-    It has to be set explicitly: left empty, ``RadixServer`` derives it from the
-    resolved bind IP (``node<ip>``), which two ranks on one host would collide on
-    and which no other process can predict. The label names the shm region and
-    the etcd ``/peers`` key, so it must be unique per node — but it is NOT the
-    cluster rank, which etcd assigns during bootstrap.
+    Mirrors ``resolve_bind_ip`` in shmradix's ``net_util.hpp``: the interface wins
+    when both it and an address are configured, and an address is used verbatim.
     """
-    return f"r{rank}"
+    env = GLOBAL_CONFIG_FROM_ENV
+    if env.radix_rpc_interface:
+        return _interface_ipv4(env.radix_rpc_interface)
+    return env.radix_rpc_address
 
 
-def shm_name_for(device_type: DeviceType,
-                 server_id: str,
-                 *,
-                 rank: int = 0,
-                 world_size: int = 1) -> str:
-    """POSIX shm name for the radix region of one device type.
+def node_name_for() -> str:
+    """This node's shmradix identity: ``SHMRADIX_NODE_NAME``, else ``node<bind-ip>``.
 
-    Mirrors what ``RadixServer.bootstrap()`` computes, so a client process can
-    derive the name without talking to the owner.
+    Same rule as ``RadixServer::bootstrap()``, but FlexKV resolves it itself and
+    passes it as ``RadixServerConfig.node_name``: shmradix applies the env override
+    only AFTER fixing the shm name, so left to shmradix the region would always be
+    named after the bind IP no matter what the env says.
     """
-    prefix = shm_radix_prefix(device_type, server_id)
-    if world_size <= 1:
-        return prefix
-    return f"{prefix}_{node_name_for(rank)}"
+    env_name = os.getenv("SHMRADIX_NODE_NAME", "")
+    if env_name:
+        return env_name
+    bind_ip = resolve_bind_ip()
+    if not bind_ip:
+        raise RuntimeError(
+            "cannot derive this node's radixshmem identity: distributed mode "
+            "falls back to the bind IP, and none resolved from "
+            "FLEXKV_RADIX_RPC_ADDRESS / FLEXKV_RADIX_RPC_INTERFACE"
+        )
+    return f"node{bind_ip}"
 
 
-def cluster_id_for(device_type: DeviceType,
-                   server_id: str,
-                   cluster_id: str) -> str:
-    """etcd namespace for one tier's cluster.
+def cluster_id_for(device_type: DeviceType) -> str:
+    """etcd namespace of one tier: ``SHMRADIX_CLUSTER_ID`` plus the tier name.
 
-    Tiers bootstrap independently — separate RHT, separate rank space — so they
-    must not share a ``/peers`` prefix or the membership gate would count a
-    peer's CPU node toward the SSD cluster.
+    Keys live under ``radix/<cluster_id>/``, and a peer entry (``peers/<node>``) is
+    keyed by node identity alone while carrying THAT tier's shm base/rkey — one
+    namespace per tier is what stops a node's tiers from overwriting each other.
+    The key set is the same in every namespace, so etcd still hands a node the same
+    dense rank in each, which is what ``create_shm_radix_regions`` demands. With the
+    env unset the base is "default", shmradix's own ``RadixServerConfig`` default.
     """
-    return f"{cluster_id}/{server_id}/{_DEVICE_KIND_NAMES[device_type]}"
+    base = os.getenv("SHMRADIX_CLUSTER_ID") or "default"
+    return f"{base}_{_DEVICE_KIND_NAMES[device_type]}"
+
+
+@contextlib.contextmanager
+def _pin_cluster_id(cluster_id: str) -> Generator[None, None, None]:
+    """Hold ``SHMRADIX_CLUSTER_ID`` at ``cluster_id`` for one bootstrap.
+
+    ``RadixServer::bootstrap`` applies that env ON TOP of the config it was given
+    (indexer/server.cpp, "Deployment-level env overrides"), so passing
+    ``RadixServerConfig.cluster_id`` alone is silently discarded wherever the env is
+    set — the per-tier namespace has to be in the env for exactly that call, and
+    restored afterwards so the next tier does not inherit it.
+    """
+    prev = os.environ.get("SHMRADIX_CLUSTER_ID")
+    os.environ["SHMRADIX_CLUSTER_ID"] = cluster_id
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("SHMRADIX_CLUSTER_ID", None)
+        else:
+            os.environ["SHMRADIX_CLUSTER_ID"] = prev
+
+
+def shm_name_for(device_type: DeviceType, shm_radix_id: str) -> str:
+    """POSIX shm name of one tier's region — owner and attachers both use this.
+
+    Standalone regions carry ``shm_radix_id`` verbatim; a distributed one appends
+    this node's identity (``node_name_for``), which is what ``bootstrap()`` does
+    with the ``node_name`` FlexKV hands it.
+    """
+    base = _shm_base(device_type, shm_radix_id)
+    if GLOBAL_CONFIG_FROM_ENV.radix_world_size <= 1:
+        return base
+    return f"{base}_{node_name_for()}"
 
 
 def device_blocks_from_config(device_type: DeviceType,
@@ -133,9 +193,8 @@ class ShmRadixOwners:
 
     def __init__(self) -> None:
         self.servers: Dict[DeviceType, shmradix.RadixServer] = {}
-        # Cluster rank etcd assigned this node, read back after bootstrap. All
-        # tiers land in the same rank because they see the same sorted peer key
-        # order; mismatch is checked and rejected in create_shm_radix_regions.
+        # Cluster rank etcd assigned this node, read back after bootstrap; a
+        # per-tier mismatch is rejected in create_shm_radix_regions.
         self.cluster_rank: int = 0
 
     def add(self, device_type: DeviceType, server: shmradix.RadixServer) -> None:
@@ -146,50 +205,46 @@ class ShmRadixOwners:
         self.servers.clear()
 
 
-def create_shm_radix_regions(model_config: ModelConfig,
-                             cache_config: CacheConfig,
-                             server_id: str,
-                             rank: int = 0,
-                             world_size: int = 1,
-                             registry: str = "",
-                             cluster_id: str = "flexkv",
-                             rpc_address: str = "",
-                             rpc_interface: str = "",
-                             rdma_dev: str = "",
-                             gid_idx: int = 3,
-                             bootstrap_timeout_sec: int = 120,
-                             remote_op_transport: str = "dc",
+def create_shm_radix_regions(cache_config: CacheConfig,
+                             shm_radix_id: str,
+                             *,
                              data_pool_ratio: int = 8,
                              evict_ratio: float = 0.05,
                              background_evict: bool = True) -> ShmRadixOwners:
     """Called by the bootstrap (instance 0, dp 0) process to create the
     shm regions. Returns an owner handle that callers must keep alive.
 
-    ``world_size > 1`` creates *distributed* regions: every node registers itself
-    under the tier's etcd namespace, the leader waits for all ``world_size`` of
-    them and assigns dense ranks, RDMA connection info is exchanged, and from
-    then on a query that outruns the local tree continues on a peer's tree over
-    RDMA. The gate is collective — each node blocks in ``bootstrap()`` until the
-    whole cluster has arrived.
+    Cluster settings are read from ``GLOBAL_CONFIG_FROM_ENV`` (FLEXKV_RADIX_*).
+    ``radix_world_size > 1`` creates *distributed* regions: every node registers
+    itself in etcd under its own identity (``SHMRADIX_NODE_NAME``, else derived
+    from the bind IP), the leader waits for all ``world_size`` of them and assigns
+    dense ranks, RDMA connection info is exchanged, and from then on a query that
+    outruns the local tree continues on a peer's tree over RDMA. The gate is
+    collective — each node blocks in ``bootstrap()`` until the whole cluster has
+    arrived, once per tier, since each tier rendezvouses in its own namespace
+    (``cluster_id_for``).
 
-    ``rank`` is only this node's local identity label. Read the cluster rank back
-    off the returned handle (``owners.cluster_rank``); that is the number the peer
-    data path addresses."""
+    Read the assigned rank back off the returned handle
+    (``owners.cluster_rank``); that is the number the peer data path addresses."""
     if shmradix is None:
         raise ImportError("shmradix not installed")
 
+    env = GLOBAL_CONFIG_FROM_ENV
+    world_size = env.radix_world_size
     if world_size > 1:
-        if not registry:
+        if not env.radix_registry:
             raise ValueError(
                 "radixshmem distributed mode needs an etcd registry "
                 "(FLEXKV_RADIX_REGISTRY, e.g. 'etcd://10.0.0.1:2379'): it is "
                 "the only cluster bootstrap path shmradix has"
             )
-        if not rpc_address and not rpc_interface:
+        if not env.radix_rpc_address and not env.radix_rpc_interface:
             raise ValueError(
                 "radixshmem distributed mode needs FLEXKV_RADIX_RPC_ADDRESS or "
-                "FLEXKV_RADIX_RPC_INTERFACE — the bootstrap IP peers dial "
-                "(use 0.0.0.0 for a single-host test)"
+                "FLEXKV_RADIX_RPC_INTERFACE — the bootstrap IP peers dial, which "
+                "also derives this node's identity: give every node a concrete "
+                "address of its own (co-located nodes: 127.0.0.1, 127.0.0.2, "
+                "...), never 0.0.0.0"
             )
 
     owners = ShmRadixOwners()
@@ -203,57 +258,53 @@ def create_shm_radix_regions(model_config: ModelConfig,
             # block count — size the node pool to n_blocks.
             max_nodes=n_blocks,
             max_blocks=n_blocks,
-            # Persist tokens_per_block into the region so any attacher (e.g. an
-            # external prefetch controller) can recover it via
+            # Persisted into the region so any attacher can recover it via
             # RadixClient.block_size() instead of being told out-of-band.
             block_size=cache_config.tokens_per_block,
             data_pool_ratio=data_pool_ratio,
             evict_ratio=evict_ratio,
             background_evict=background_evict,
         )
-        name = shm_name_for(dt, server_id, rank=rank, world_size=world_size)
+        name = shm_name_for(dt, shm_radix_id)
         flexkv_logger.info(
             f"creating shm radix region {name} "
             f"(max_nodes={cfg.max_nodes}, max_blocks={cfg.max_blocks}, "
-            f"rank={rank}/{world_size})"
+            f"world_size={world_size})"
         )
         if world_size > 1:
             server_cfg = shmradix.RadixServerConfig()
-            # RadixServer appends "_" + node_name to this prefix.
-            server_cfg.name = shm_radix_prefix(dt, server_id)
+            # bootstrap() names the region `name + "_" + node_name`, so it gets the
+            # bare tier name plus the identity shm_name_for used. No cluster_id.
+            server_cfg.name = _shm_base(dt, shm_radix_id)
+            server_cfg.node_name = node_name_for()
             server_cfg.shm = cfg
-            # Local identity, not the cluster rank. Set explicitly so the name is
-            # deterministic for the client processes that must attach to it.
-            server_cfg.node_name = node_name_for(rank)
-            server_cfg.rank = rank
+            # No rank here: etcd assigns it and bootstrap() overwrites it.
             server_cfg.world_size = world_size
-            # The membership gate is max(num_shards, expected_min_nodes) and
-            # expected_min_nodes is not exposed to Python — so num_shards is the
-            # only way to make bootstrap wait for the whole cluster instead of
-            # completing with one node. world_size is also what the shard map
-            # defaults to, so this changes nothing else.
+            # The membership gate is max(num_shards, expected_min_nodes) and only
+            # num_shards is reachable from Python; world_size is its default.
             server_cfg.num_shards = world_size
-            # Each tier is its own cluster with its own rank space.
-            server_cfg.registry = registry
-            server_cfg.cluster_id = cluster_id_for(dt, server_id, cluster_id)
-            server_cfg.rpc_address = rpc_address
-            server_cfg.rpc_interface = rpc_interface
-            server_cfg.remote_op_transport = remote_op_transport
-            server_cfg.rdma_dev = rdma_dev
-            server_cfg.gid_idx = gid_idx
-            server_cfg.bootstrap_timeout_sec = bootstrap_timeout_sec
+            server_cfg.registry = env.radix_registry
+            server_cfg.cluster_id = cluster_id_for(dt)
+            server_cfg.rpc_address = env.radix_rpc_address
+            server_cfg.rpc_interface = env.radix_rpc_interface
+            server_cfg.remote_op_transport = env.radix_remote_op_transport
+            server_cfg.rdma_dev = env.radix_rdma_dev
+            server_cfg.gid_idx = env.radix_gid_idx
+            server_cfg.bootstrap_timeout_sec = env.radix_bootstrap_timeout_sec
             # Unlike the single-node overload, this ctor does NOT create the shm
             # region — bootstrap() does, and it is not idempotent.
             server = shmradix.RadixServer(server_cfg)
-            if not server.bootstrap():
+            with _pin_cluster_id(server_cfg.cluster_id):
+                ok = server.bootstrap()
+            if not ok:
                 raise RuntimeError(
                     f"radixshmem cluster bootstrap failed for {name} "
-                    f"(node_name={server_cfg.node_name}, "
-                    f"world_size={world_size}, registry={registry}, "
+                    f"(world_size={world_size}, registry={env.radix_registry}, "
                     f"cluster_id={server_cfg.cluster_id}); check that etcd is "
                     f"reachable, that all {world_size} nodes joined within "
-                    f"{bootstrap_timeout_sec}s, and that shmradix was built "
-                    f"with RDMA + etcd support"
+                    f"{env.radix_bootstrap_timeout_sec}s under a DISTINCT etcd "
+                    f"identity (SHMRADIX_NODE_NAME, else derived from the bind "
+                    f"IP), and that shmradix was built with RDMA + etcd support"
                 )
             if not server.is_distributed():
                 raise RuntimeError(
@@ -263,22 +314,18 @@ def create_shm_radix_regions(model_config: ModelConfig,
                 )
             actual_name = server.shm_name()
             if actual_name != name:
-                # Our clients attach by the computed name, so a drift in
-                # RadixServer's naming rule would leave them polling forever.
                 raise RuntimeError(
-                    f"radixshmem named the region {actual_name!r} but FlexKV "
-                    f"clients will look for {name!r}; shm_name_for() no longer "
-                    f"mirrors RadixServer.bootstrap()"
+                    f"radixshmem named the region {actual_name!r} but attachers "
+                    f"ask for {name!r}; shm_name_for() no longer mirrors "
+                    f"RadixServer.bootstrap()"
                 )
-            cluster_ranks[dt] = int(server.rank())
         else:
             server = shmradix.RadixServer(name, cfg)
-            cluster_ranks[dt] = int(server.rank())
+        cluster_ranks[dt] = int(server.rank())
         owners.add(dt, server)
 
-    # Every tier sees the same sorted peer key order, so they must agree. If they
-    # don't, one node id can't stand for all tiers and the peer data path would
-    # read from the wrong node.
+    # Tiers rendezvous independently, so their ranks must agree — one node id has
+    # to stand for all of them or the peer data path addresses the wrong node.
     distinct = set(cluster_ranks.values())
     if len(distinct) > 1:
         raise RuntimeError(
@@ -286,19 +333,15 @@ def create_shm_radix_regions(model_config: ModelConfig,
             f"{ {_DEVICE_KIND_NAMES[k]: v for k, v in cluster_ranks.items()} }; "
             f"FlexKV needs one node id for all tiers"
         )
-    owners.cluster_rank = distinct.pop() if distinct else rank
+    owners.cluster_rank = distinct.pop() if distinct else 0
     if world_size > 1:
+        namespaces = ", ".join(cluster_id_for(dt) for dt in cluster_ranks)
         flexkv_logger.info(
-            f"radixshmem cluster bootstrap done: local label "
-            f"{node_name_for(rank)} -> cluster rank {owners.cluster_rank} "
-            f"(world_size={world_size})"
+            f"radixshmem cluster bootstrap done: {shm_radix_id} -> cluster rank "
+            f"{owners.cluster_rank} (world_size={world_size}, "
+            f"etcd namespaces: {namespaces})"
         )
     return owners
-
-
-def cluster_ready_timeout_s() -> float:
-    """How long an attacher waits for the owner's bootstrap to settle."""
-    return float(os.getenv("FLEXKV_RADIX_BOOTSTRAP_TIMEOUT_SEC", "120"))
 
 
 def attach_radix_client(shm_name: str,
@@ -307,13 +350,16 @@ def attach_radix_client(shm_name: str,
                         ) -> shmradix.RadixClient:
     """Attach a RadixClient to `shm_name`, waiting for cluster readiness.
 
+    `shm_name` is what `shm_name_for` spells out — the full name including the node
+    identity, so there is nothing left to resolve here.
+
     The owner creates the region BEFORE it calls `bootstrap()` and stamps the
     cluster manifest (world_size, rank, RDMA plane) into the header only once
     bootstrap settles. A client that attaches in the window between the two sees
     a standalone header: it reports `world_size=1`, `rank()=0` and skips the RDMA
     plane permanently, no matter what the header says later. So when the caller
-    expects a cluster, waiting for the shm file to appear is not enough — attach
-    is retried until the region reports itself distributed.
+    expects a cluster, waiting for the region to appear is not enough — attach is
+    retried until it reports itself distributed.
 
     Returns the client. If the region never became distributed in time the
     standalone client is returned anyway, leaving the degrade-or-fail decision to
@@ -322,20 +368,18 @@ def attach_radix_client(shm_name: str,
     if shmradix is None:
         raise ImportError("shmradix not installed")
     if wait_timeout_s is None:
-        wait_timeout_s = cluster_ready_timeout_s()
+        wait_timeout_s = float(GLOBAL_CONFIG_FROM_ENV.radix_bootstrap_timeout_sec)
 
-    shm_path = f"/dev/shm{shm_name}"
     deadline = time.monotonic() + wait_timeout_s
     client = None
     while True:
-        if os.path.exists(shm_path):
-            try:
-                client = shmradix.RadixClient(shm_name)
-                if not expect_distributed or client.is_distributed():
-                    return client
-            except Exception as e:
-                flexkv_logger.debug(
-                    f"attach to {shm_name} failed (will retry): {e}")
+        try:
+            client = shmradix.RadixClient(shm_name)
+            if not expect_distributed or client.is_distributed():
+                return client
+        except Exception as e:
+            flexkv_logger.debug(
+                f"attach to {shm_name} failed (will retry): {e}")
         if time.monotonic() >= deadline:
             if client is None:
                 raise TimeoutError(
@@ -343,46 +387,3 @@ def attach_radix_client(shm_name: str,
                 )
             return client
         time.sleep(0.01)
-
-
-def attach_shm_radix_clients(cache_config: CacheConfig,
-                             server_id: str,
-                             rank: int = 0,
-                             world_size: int = 1,
-                             wait_timeout_s: Optional[float] = None):
-    """Attach a RadixClient per enabled device type. Polls until the owner has
-    created the shm files AND (for world_size > 1) finished bootstrap, since
-    `rank()` on a client that attached mid-bootstrap reads back 0 on every
-    node."""
-    if shmradix is None:
-        raise ImportError("shmradix not installed")
-    if wait_timeout_s is None:
-        wait_timeout_s = cluster_ready_timeout_s()
-
-    clients: Dict[DeviceType, shmradix.RadixClient] = {}
-    deadline = time.monotonic() + wait_timeout_s
-    pending = list(enabled_devices(cache_config))
-    while pending and time.monotonic() < deadline:
-        next_pending = []
-        for dt in pending:
-            name = shm_name_for(dt, server_id, rank=rank, world_size=world_size)
-            remaining = max(0.0, deadline - time.monotonic())
-            client = attach_radix_client(name,
-                                         expect_distributed=world_size > 1,
-                                         wait_timeout_s=remaining)
-            if client is None or (world_size > 1 and not client.is_distributed()):
-                next_pending.append(dt)
-                continue
-            clients[dt] = client
-        pending = next_pending
-        if pending:
-            time.sleep(0.01)
-    if pending:
-        names = [
-            shm_name_for(dt, server_id, rank=rank, world_size=world_size)
-            for dt in pending
-        ]
-        raise TimeoutError(
-            f"Timed out attaching to shm radix regions: {names}"
-        )
-    return clients

@@ -274,7 +274,6 @@ class CacheEngineRadixShmem:
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
         self.evict_start_threshold = evict_start_threshold
-        self.shm_name = shm_name
 
         self.event_collector = event_collector
         self._metrics_collector = metrics_collector
@@ -284,14 +283,17 @@ class CacheEngineRadixShmem:
 
         from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
         from flexkv.server.shm_radix_bootstrap import attach_radix_client
-        expect_cluster = self.peer_enabled and getattr(
-            GLOBAL_CONFIG_FROM_ENV, "radix_world_size", 1) > 1
+        expect_cluster = (self.peer_enabled and
+                          GLOBAL_CONFIG_FROM_ENV.radix_world_size > 1)
         self._tree = attach_radix_client(shm_name,
                                          expect_distributed=expect_cluster)
+        # A distributed region extends the name FlexKV asked for with shmradix's
+        # node identity; log the resolved one, not the prefix.
+        self.shm_name = self._tree.name()
         if self.peer_enabled and not self._tree.is_distributed():
             flexkv_logger.warning(
-                f"radixshmem peer matching is enabled for {shm_name} but the "
-                f"attached region has world_size=1; GETs stay local-only"
+                f"radixshmem peer matching is enabled for {self.shm_name} but "
+                f"the attached region has world_size=1; GETs stay local-only"
             )
             self.peer_enabled = False
 

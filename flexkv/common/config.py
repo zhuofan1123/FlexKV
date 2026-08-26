@@ -748,33 +748,16 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # via shm channel IPC). When True, KVServer is not started; each DP process
     # builds its own KVTaskEngine and attaches to shared radix regions.
     radix_shmem=bool(int(os.getenv('FLEXKV_RADIX_SHMEM', 0))),
-    # Identifier used to name radix shm regions and TE shm channels. Lets
-    # multiple FlexKV instances coexist on a host.
-    shm_radix_server_id=os.getenv('FLEXKV_SHM_RADIX_ID', 'default'),
-    # Cross-node radixshmem cluster (distributed KV reuse). world_size > 1 turns
-    # the region into a distributed one (RDMA-connected router hash table +
-    # remote tree walks). Membership goes through etcd, the only cluster
-    # bootstrap path shmradix has: every node writes itself under
-    # <cluster_id>/peers and the leader gates on all `world_size` of them
-    # arriving, then assigns dense ranks by sorted key order.
-    #
-    # `radix_rank` is therefore only a LOCAL identity label — it names this
-    # node's shm region and its etcd key, so it must be unique per node but need
-    # not equal the cluster rank. The cluster rank is an OUTPUT read back from
-    # the region (`RadixClient.rank()`), and THAT is the FlexKV node id the peer
-    # data path (PEERH2H / PEERSSD2H) addresses. Using it as a node id requires a
-    # Redis instance dedicated to this one cluster, since node ids are otherwise
-    # handed out by `global:node_id`.
-    radix_rank=int(os.getenv('FLEXKV_RADIX_RANK', 0)),
+    # Names this FlexKV's radix shm regions and TE shm channels; pass it only to
+    # tell apart several FlexKV instances sharing one node.
+    shm_radix_id=os.getenv('FLEXKV_SHM_RADIX_ID', 'flexkv'),
     radix_world_size=int(os.getenv('FLEXKV_RADIX_WORLD_SIZE', 1)),
     # etcd endpoint carrying cluster membership, e.g. "etcd://10.0.0.1:2379".
+    # SHMRADIX_CLUSTER_ID is only the BASE namespace: each tier rendezvouses in
+    # "<base>_<tier>" (shm_radix_bootstrap.cluster_id_for).
     radix_registry=os.getenv('FLEXKV_RADIX_REGISTRY', ''),
-    # Namespace under which this cluster's membership lives. Each tier gets its
-    # own sub-namespace (see shm_radix_bootstrap), since tiers bootstrap as
-    # independent clusters.
-    radix_cluster_id=os.getenv('FLEXKV_RADIX_CLUSTER_ID', 'flexkv'),
-    # Bootstrap IP peers dial, published to etcd. One of the two is required when
-    # world_size > 1; the interface name wins when both are set.
+    # Bootstrap IP peers dial, required when world_size > 1 (interface wins when
+    # both are set); a concrete per-node address, since it also derives the identity.
     radix_rpc_address=os.getenv('FLEXKV_RADIX_RPC_ADDRESS', ''),
     radix_rpc_interface=os.getenv('FLEXKV_RADIX_RPC_INTERFACE', ''),
     radix_rdma_dev=os.getenv('FLEXKV_RADIX_RDMA_DEV', ''),

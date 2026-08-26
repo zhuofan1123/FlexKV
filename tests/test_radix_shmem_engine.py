@@ -902,10 +902,8 @@ def _rank_main(rank, prefix, cluster_id, registry, rdma_dev, ready, done, output
             data_pool_ratio=8,
             background_evict=True,
         )
-        # Mirrors flexkv.server.shm_radix_bootstrap.create_shm_radix_regions:
-        # membership goes through etcd, and RadixServer names the region
-        # `name + "_" + node_name` — so node_name is what keeps two ranks on one
-        # host from colliding on the same shm file.
+        # FlexKV leaves node_name/cluster_id to shmradix; this test sets them so
+        # one host's two ranks get a private namespace and distinct region names.
         cfg = shmradix.RadixServerConfig()
         cfg.rht_slots_per_bucket = rht_slots_per_bucket
         cfg.name = prefix
@@ -1028,7 +1026,7 @@ def _run_two_ranks(registry, rdma_dev, local_head_blocks=0,
     ready = ctx.Event()
     done = ctx.Event()
     output = ctx.Queue()
-    prefix = f"/flexkv_radix_peer_test_{os.getpid()}_{local_head_blocks}"
+    prefix = f"/shmradix_peer_test_{os.getpid()}_{local_head_blocks}"
     # The cluster id is the etcd namespace the two ranks meet in. Carrying the
     # pid and the case keeps a rerun (or a leftover key from a crashed run) from
     # being counted as a third member of this cluster.

@@ -155,6 +155,9 @@ class RedisNodeInfo:
         # Heartbeat interval – renew TTL at roughly 1/3 of the TTL period
         self.heartbeat_interval_seconds: float = max(1.0, self.node_ttl_seconds / 3.0)
         self._node_id: Optional[int] = None
+        # meta:<id> key whose TTL the heartbeat renews alongside node:<id>
+        self._meta_key: Optional[str] = None
+        self._meta_ttl_seconds: int = 0
         self._running = False
         self._listener_thread: Optional[threading.Thread] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
@@ -348,7 +351,17 @@ class RedisNodeInfo:
     def is_node_active(self, node_id: int) -> bool:
         """Check if a node_id is active - lock-free RCU check"""
         return node_id in self.current_node_id_set
-    
+
+    def track_meta_key(self, key: str, ttl_seconds: int) -> None:
+        """Let the heartbeat renew this node's meta:<id> key together with node:<id>.
+
+        The meta hash is written once at startup, so without renewal it expires
+        while the process is still alive and peers can no longer resolve our RDMA
+        addresses (they then see the node as active but have no meta for it).
+        """
+        self._meta_key = str(key)
+        self._meta_ttl_seconds = int(ttl_seconds)
+
     def _heartbeat_worker(self) -> None:
         """Background thread that periodically renews the TTL of node:<id> key.
         
@@ -375,6 +388,13 @@ class RedisNodeInfo:
                     else:
                         print(f"[RedisNodeInfo] WARNING: node key {node_key} expired/missing, "
                               f"skipping hset to avoid resurrection")
+
+                if self._meta_key is not None and self._meta_ttl_seconds > 0:
+                    # Renew only: an expired meta key must not come back without
+                    # its buffer pointers being re-registered.
+                    if not heartbeat_client.expire(self._meta_key, self._meta_ttl_seconds):
+                        print(f"[RedisNodeInfo] WARNING: meta key {self._meta_key} expired/missing, "
+                              f"peers can no longer fetch this node's meta")
 
             except Exception:
                 # Connection lost, reset client so it reconnects next iteration
@@ -788,11 +808,12 @@ class RedisMeta:
             "pp_rank": int(pp_rank),
             "pp_size": int(pp_size),
         })
-        # Set TTL on meta key so it auto-expires after node crash.
-        # The heartbeat in regist_node_meta_renew_ttl() will keep it alive.
+        # Set TTL on meta key so it auto-expires after node crash; the nodeinfo
+        # heartbeat renews it for as long as this process lives.
         meta_ttl = self.nodeinfo.node_ttl_seconds * self.META_TTL_MULTIPLIER
         if meta_ttl > 0:
             r.expire(key, meta_ttl)
+            self.nodeinfo.track_meta_key(key, meta_ttl)
 
     def get_node_meta(self, node_id: int) -> dict:
         """Get node meta information from Redis.

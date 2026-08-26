@@ -2726,6 +2726,14 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         task_info_list = self.op_parser(transfer_op)
+        if not task_info_list:
+            # Every peer was skipped (meta unavailable): the destination blocks stay
+            # unwritten, so reporting success would feed stale CPU blocks to the model.
+            flexkv_logger.error(
+                f"{transfer_op.transfer_type.name} op {transfer_op.transfer_op_id} has no "
+                f"transfer task, no peer meta available for its blocks"
+            )
+            return False
 
         start_time = time.time()
         transfered_size = 0

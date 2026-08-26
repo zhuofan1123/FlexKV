@@ -91,7 +91,7 @@ def _dp_proc(dp_client_id, dp_size, server_id, write_barrier, result_q):
     from flexkv.kvmanager import KVManager
 
     GLOBAL_CONFIG_FROM_ENV.radix_shmem = True
-    GLOBAL_CONFIG_FROM_ENV.shm_radix_server_id = server_id
+    GLOBAL_CONFIG_FROM_ENV.shm_radix_id = server_id
     GLOBAL_CONFIG_FROM_ENV.enable_mps = False
     GLOBAL_CONFIG_FROM_ENV.server_recv_port = f"ipc:///tmp/flexkv_{server_id}"
 

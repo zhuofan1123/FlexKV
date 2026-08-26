@@ -9,9 +9,12 @@ what the reader's GPU ends up holding.
 
 Topology (single host, two processes, two GPUs):
 
-  * both nodes bootstrap their OWN shm radix regions under one etcd namespace
-    (same server_id, rank 0/1, world_size=2 -> region names get an `_r{rank}`
-    suffix), so shmradix hands them dense cluster ranks and an RHT to route by;
+  * both nodes bootstrap their OWN shm radix regions (distinct
+    FLEXKV_SHM_RADIX_ID, hence distinct region names) under one shared etcd
+    namespace with world_size=2, so shmradix hands them dense cluster ranks --
+    which become their FlexKV node ids -- and an RHT to route by; they share the
+    loopback bootstrap address and take a distinct SHMRADIX_NODE_NAME each, since
+    that name is the identity shmradix registers under in etcd;
   * each node registers its CPU block buffer with its own mooncake engine and
     publishes `meta:<node_id>` (mooncake addr + buffer base) to a shared Redis,
     which is how PEERH2H turns a peer's slot id into an RDMA/TCP read;
@@ -51,6 +54,12 @@ directory, which a cu13 torch install does not otherwise provide.
 
 `FLEXKV_TEST_PEER_TIER` picks which tier carries the peer tail: `cpu` (default,
 PEERH2H) or `ssd` (PEERSSD2H, node 0 serving out of its own SSD files).
+
+⚠️ `ssd` also needs a CPU tier for staging, so each node bootstraps TWO
+distributed trees -- and a node has ONE etcd identity for all of them, so its two
+trees overwrite each other's `/peers` entry. FlexKV catches that as "assigned
+different cluster ranks per tier" and refuses to start, so until shmradix
+namespaces per tree only `cpu` is runnable here.
 """
 from __future__ import annotations
 
@@ -78,6 +87,16 @@ NUM_REQUEST_BLOCKS = 16
 FIRST_BLOCK = 8
 PATTERN_SEED = 0xBEEF
 WORLD_SIZE = 2
+
+
+def node_tag_for(run_id: str, rank: int) -> str:
+    """Per-node tag of one of the co-located nodes.
+
+    It names this node's shm regions (FLEXKV_SHM_RADIX_ID) and the identity
+    it registers in etcd (SHMRADIX_NODE_NAME); both must differ between the two
+    nodes or the second overwrites the first and the cluster never forms.
+    """
+    return f"{run_id}_r{rank}"
 
 
 def _free_port() -> int:
@@ -228,7 +247,7 @@ def _tp_client_proc(server_recv_port, model_config, cache_config,
         time.sleep(1)
 
 
-def _node_proc(rank, gpu_id, server_id, registry, cluster_id, rdma_dev,
+def _node_proc(rank, gpu_id, run_id, registry, cluster_id, rdma_dev,
                redis_port, mooncake_config, zmq_port, tier, ssd_dir,
                written, read_done, result_q):
     """One FlexKV node: rank 0 writes the prefix, rank 1 reads it off the peer."""
@@ -236,15 +255,20 @@ def _node_proc(rank, gpu_id, server_id, registry, cluster_id, rdma_dev,
     # while still addressing it as device 0 (KVTPClient derives the device id
     # from dp_client_id/tp_rank, which are 0 on both nodes).
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    recv_port = f"ipc:///tmp/flexkv_{server_id}_r{rank}"
+    node_tag = node_tag_for(run_id, rank)
+    recv_port = f"ipc:///tmp/flexkv_{node_tag}"
     os.environ.update({
         "FLEXKV_RADIX_SHMEM": "1",
-        "FLEXKV_SHM_RADIX_ID": server_id,
-        "FLEXKV_RADIX_RANK": str(rank),
+        "FLEXKV_SHM_RADIX_ID": node_tag,
         "FLEXKV_RADIX_WORLD_SIZE": str(WORLD_SIZE),
         "FLEXKV_RADIX_REGISTRY": registry,
-        "FLEXKV_RADIX_CLUSTER_ID": cluster_id,
-        # Single host: peers dial back over loopback.
+        # shmradix's own namespace, shared by the two nodes: it keeps concurrent
+        # runs on one etcd from joining each other's cluster.
+        "SHMRADIX_CLUSTER_ID": cluster_id,
+        # etcd keys membership by node identity, which defaults to the bind IP the
+        # co-located nodes share -- so override it per node.
+        "SHMRADIX_NODE_NAME": node_tag,
+        # Single host: peers dial back over loopback (the port is OS-assigned).
         "FLEXKV_RADIX_RPC_ADDRESS": "127.0.0.1",
         "FLEXKV_RADIX_RDMA_DEV": rdma_dev,
         "FLEXKV_ENABLE_MPS": "0",
@@ -264,11 +288,9 @@ def _node_proc(rank, gpu_id, server_id, registry, cluster_id, rdma_dev,
     # assignments above precede -- but this process may have imported it earlier
     # through a parent module, so set the fields that matter explicitly.
     GLOBAL_CONFIG_FROM_ENV.radix_shmem = True
-    GLOBAL_CONFIG_FROM_ENV.shm_radix_server_id = server_id
-    GLOBAL_CONFIG_FROM_ENV.radix_rank = rank
+    GLOBAL_CONFIG_FROM_ENV.shm_radix_id = node_tag
     GLOBAL_CONFIG_FROM_ENV.radix_world_size = WORLD_SIZE
     GLOBAL_CONFIG_FROM_ENV.radix_registry = registry
-    GLOBAL_CONFIG_FROM_ENV.radix_cluster_id = cluster_id
     GLOBAL_CONFIG_FROM_ENV.radix_rpc_address = "127.0.0.1"
     GLOBAL_CONFIG_FROM_ENV.radix_rdma_dev = rdma_dev
     GLOBAL_CONFIG_FROM_ENV.enable_mps = False
@@ -418,7 +440,7 @@ def main() -> int:
 
     rdma_dev = devices[0]
     protocol = os.getenv("FLEXKV_TEST_MOONCAKE_PROTOCOL", "tcp")
-    server_id = f"peerdata{os.getpid()}"
+    run_id = f"peerdata{os.getpid()}"
     cluster_id = f"flexkv_peer_data_{os.getpid()}"
     redis_port = _free_port()
     redis_dir = f"/tmp/flexkv_peer_data_{os.getpid()}"
@@ -467,7 +489,7 @@ def main() -> int:
         for rank in range(WORLD_SIZE):
             proc = ctx.Process(
                 target=_node_proc,
-                args=(rank, rank, server_id, registry, cluster_id, rdma_dev,
+                args=(rank, rank, run_id, registry, cluster_id, rdma_dev,
                       redis_port, configs[rank], zmq_base + rank * 2, tier,
                       ssd_dirs[rank], written, read_done, result_q),
                 daemon=False,
@@ -497,10 +519,12 @@ def main() -> int:
         from flexkv.server.shm_radix_bootstrap import shm_name_for
         for rank in range(WORLD_SIZE):
             for device in (DeviceType.CPU, DeviceType.SSD):
-                name = shm_name_for(device, server_id, rank=rank,
-                                    world_size=WORLD_SIZE)
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink("/dev/shm" + name)
+                name = shm_name_for(device, node_tag_for(run_id, rank))
+                # A distributed region appends shmradix's node identity, and its
+                # RHT shards extend that again -- so sweep by prefix.
+                for stale in glob.glob(f"/dev/shm{name}*"):
+                    with contextlib.suppress(OSError):
+                        os.unlink(stale)
         shutil.rmtree(redis_dir, ignore_errors=True)
 
     print("\n=== RESULTS ===")

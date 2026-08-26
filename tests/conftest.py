@@ -78,15 +78,14 @@ def radix_shmem_env(request):
     from flexkv.server.shm_radix_bootstrap import (create_shm_radix_regions,
                                                    shm_name_for)
 
-    server_id = f"{request.module.__name__.replace('_', '')}{os.getpid()}"
-    ssd_dir = f"/tmp/flexkv_radix_env_{server_id}"
+    shm_radix_id = f"{request.module.__name__.replace('_', '')}{os.getpid()}"
+    ssd_dir = f"/tmp/flexkv_radix_env_{shm_radix_id}"
 
     saved = {name: getattr(GLOBAL_CONFIG_FROM_ENV, name)
-             for name in ("radix_shmem", "shm_radix_server_id",
-                          "radix_rank", "radix_world_size")}
+             for name in ("radix_shmem", "shm_radix_id",
+                          "radix_world_size")}
     GLOBAL_CONFIG_FROM_ENV.radix_shmem = True
-    GLOBAL_CONFIG_FROM_ENV.shm_radix_server_id = server_id
-    GLOBAL_CONFIG_FROM_ENV.radix_rank = 0
+    GLOBAL_CONFIG_FROM_ENV.shm_radix_id = shm_radix_id
     GLOBAL_CONFIG_FROM_ENV.radix_world_size = 1
 
     model_config = ModelConfig(num_layers=2, num_kv_heads=4, head_size=64,
@@ -104,11 +103,11 @@ def radix_shmem_env(request):
     tiers = (DeviceType.CPU, DeviceType.SSD)
     for device_type in tiers:
         with contextlib.suppress(FileNotFoundError):
-            os.unlink("/dev/shm" + shm_name_for(device_type, server_id))
+            os.unlink("/dev/shm" + shm_name_for(device_type, shm_radix_id))
     # Hold the owner handle for the module's lifetime: dropping it unlinks the
     # regions out from under the engine.
-    owners = create_shm_radix_regions(model_config, cache_config,
-                                      server_id=server_id)
+    owners = create_shm_radix_regions(cache_config,
+                                      shm_radix_id=shm_radix_id)
 
     engine = GlobalCacheEngine(cache_config, model_config)
     assert engine.use_radix_shmem, "fixture did not get the radixshmem backend"
@@ -118,7 +117,7 @@ def radix_shmem_env(request):
         del owners
         for device_type in tiers:
             with contextlib.suppress(FileNotFoundError):
-                os.unlink("/dev/shm" + shm_name_for(device_type, server_id))
+                os.unlink("/dev/shm" + shm_name_for(device_type, shm_radix_id))
         shutil.rmtree(ssd_dir, ignore_errors=True)
         for name, value in saved.items():
             setattr(GLOBAL_CONFIG_FROM_ENV, name, value)

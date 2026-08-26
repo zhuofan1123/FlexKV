@@ -27,7 +27,8 @@ Why this is safe to run alongside internal FlexKV:
 
 Prerequisites (the running FlexKV instance provides these via shm; the caller
 only needs the server_id):
-  * FlexKV running in radix_shmem mode with a known `shm_radix_server_id`.
+  * FlexKV running in radix_shmem mode; `server_id` = that instance's
+    `FLEXKV_SHM_RADIX_ID`.
   * The FlexKV bootstrap must have reserved at least one extra TE channel
     (`num_extra_te_channels >= 1`, default 1) so a reserved channel exists at
     `channel_id = total_clients` (published in the TE ctrl block).

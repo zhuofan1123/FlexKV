@@ -53,19 +53,16 @@ class KVManager:
         else:
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
-        self.use_radix_shmem = bool(getattr(GLOBAL_CONFIG_FROM_ENV,
-                                            "radix_shmem", False))
+        self.use_radix_shmem = GLOBAL_CONFIG_FROM_ENV.radix_shmem
         if self.use_radix_shmem and cache_config.enable_remote:
             # CacheEngineRadixShmem indexes the CPU/SSD tiers it owns in shm and
-            # reaches peers over RDMA; the 3rd-party (PCFS) tier has its own
-            # Redis-published index and GET planner. Mixing the two would need a
-            # combined match, so keep them mutually exclusive.
+            # reaches peers over RDMA; but the 3rd-party (PCFS) tier has its own
+            # Redis-published index and GET planner.
             raise ValueError(
                 "radix_shmem and enable_remote (3rd-party remote storage) "
                 "cannot be enabled at the same time"
             )
-        self._shm_radix_server_id = getattr(GLOBAL_CONFIG_FROM_ENV,
-                                            "shm_radix_server_id", "default")
+        self._shm_radix_id = GLOBAL_CONFIG_FROM_ENV.shm_radix_id
 
         flexkv_logger.info(
             f"[KVManager] IPC ports: server_recv_port={self.server_recv_port}, "
@@ -75,7 +72,7 @@ class KVManager:
 
         if self.use_radix_shmem:
             flexkv_logger.info(f"[KVManager] radix_shmem is enabled"
-                               f"[KVManager] shm_radix_server_id: {self._shm_radix_server_id}")
+                               f"[KVManager] shm_radix_id: {self._shm_radix_id}")
 
         # Multi-instance mode also requires server_client_mode
         if self.use_radix_shmem:
@@ -155,91 +152,48 @@ class KVManager:
                                event_collector: Optional[KVEventCollector]) -> None:
         """Initialize the radix-shmem multi-DP path.
 
-        Bootstrap proc (instance 0, dp 0):
-          1. Create radix shm regions (one RadixServer per device type).
-          2. Spawn the single TE subprocess (which creates per-CE shm channels).
+        Everything shared by the DP processes of this node — the radix shm
+        regions and the single TE subprocess — is set up by the bootstrap proc
+        (dp 0) only. Every other proc just builds its own KVTaskEngine and
+        attaches: `CacheEngineRadixShmem` polls for its region, and the TE
+        channel handle blocks in `ShmControlBlock.wait_ready`.
 
-        Other DP procs:
-          1. Poll for the radix shm regions (created by bootstrap).
-          2. Continue — TE channel attach blocks on `ShmControlBlock.wait_ready`
-             inside `TransferManagerShmChannelHandle`.
-
-        Each CE process gets a disjoint graph_id range so submissions to the
+        Each CE process gets a disjoint graph/op id range so submissions to the
         single shared TE never collide.
         """
-        from flexkv.server.shm_radix_bootstrap import (
-            create_shm_radix_regions, attach_shm_radix_clients,
+        from flexkv.common.transfer import TransferOp
+
+        TransferOpGraph.set_graph_id_range(self.dp_client_id << 32,
+                                           (self.dp_client_id + 1) << 32)
+        TransferOp.set_op_id_range(self.dp_client_id << 32,
+                                   (self.dp_client_id + 1) << 32)
+
+        if self.dp_client_id == 0:
+            self._bootstrap_radix_shmem()
+
+        # GlobalCacheEngine reads GLOBAL_CONFIG_FROM_ENV.radix_shmem and builds a
+        # CacheEngineRadixShmem (RadixClient) per device type.
+        self.kv_task_engine = KVTaskEngine(
+            self.model_config, self.cache_config,
+            self.gpu_register_port,
+            redis_meta=self.redis_meta_client,
+            event_collector=event_collector,
+            shm_te_server_id=self._shm_radix_id,
+            shm_te_channel_id=self.dp_client_id,
         )
+
+    def _bootstrap_radix_shmem(self) -> None:
+        """Bootstrap proc (dp 0) only: create the shm regions, claim this node's
+        id, and spawn the shared TE."""
+        from flexkv.server.shm_radix_bootstrap import create_shm_radix_regions
         from flexkv.transfer_manager import TransferManagerShmTEProcess
 
-        is_bootstrap = (self.dp_client_id == 0)
-        total_clients = self.model_config.total_clients
-        server_id = self._shm_radix_server_id
-        radix_rank = getattr(GLOBAL_CONFIG_FROM_ENV, "radix_rank", 0)
-        radix_world_size = getattr(
-            GLOBAL_CONFIG_FROM_ENV, "radix_world_size", 1
+        self._shm_radix_owners = create_shm_radix_regions(
+            self.cache_config, shm_radix_id=self._shm_radix_id
         )
-
-        te_server_id = (
-            f"{server_id}_r{radix_rank}"
-            if radix_world_size > 1 else server_id
-        )
-
-        from flexkv.common.transfer import TransferOp
-        TransferOpGraph.set_graph_id_range(
-            self.dp_client_id << 32,
-            (self.dp_client_id + 1) << 32,
-        )
-        TransferOp.set_op_id_range(
-            self.dp_client_id << 32,
-            (self.dp_client_id + 1) << 32,
-        )
-
-        if is_bootstrap:
-            self._shm_radix_owners = create_shm_radix_regions(
-                self.model_config, self.cache_config,
-                server_id=server_id,
-                rank=radix_rank,
-                world_size=radix_world_size,
-                registry=getattr(GLOBAL_CONFIG_FROM_ENV, "radix_registry", ""),
-                cluster_id=getattr(
-                    GLOBAL_CONFIG_FROM_ENV, "radix_cluster_id", "flexkv"
-                ),
-                rpc_address=getattr(
-                    GLOBAL_CONFIG_FROM_ENV, "radix_rpc_address", ""
-                ),
-                rpc_interface=getattr(
-                    GLOBAL_CONFIG_FROM_ENV, "radix_rpc_interface", ""
-                ),
-                rdma_dev=getattr(GLOBAL_CONFIG_FROM_ENV, "radix_rdma_dev", ""),
-                gid_idx=getattr(GLOBAL_CONFIG_FROM_ENV, "radix_gid_idx", 3),
-                bootstrap_timeout_sec=getattr(
-                    GLOBAL_CONFIG_FROM_ENV,
-                    "radix_bootstrap_timeout_sec", 120,
-                ),
-                remote_op_transport=getattr(
-                    GLOBAL_CONFIG_FROM_ENV, "radix_remote_op_transport", "dc"
-                ),
-            )
-            cluster_rank = self._shm_radix_owners.cluster_rank
-        else:
-            clients = attach_shm_radix_clients(
-                self.cache_config,
-                server_id=server_id,
-                rank=radix_rank,
-                world_size=radix_world_size,
-            )
-            cluster_rank = (int(next(iter(clients.values())).rank())
-                            if clients else radix_rank)
 
         if self.cache_config.enable_kv_sharing:
-            node_id = cluster_rank
-            flexkv_logger.info(
-                f"[kv manager] radix local label r{radix_rank} -> cluster rank "
-                f"{cluster_rank}/{radix_world_size} = FlexKV node id {node_id}; "
-                f"RedisMeta at "
-                f"{self.cache_config.redis_host}:{self.cache_config.redis_port}"
-            )
+            node_id = self._shm_radix_owners.cluster_rank
             self.redis_meta_client = RedisMeta(
                 self.cache_config.redis_host,
                 self.cache_config.redis_port,
@@ -247,42 +201,29 @@ class KVManager:
                 self.cache_config.local_ip,
                 node_ttl_seconds=self.cache_config.node_ttl_seconds,
             )
-            if is_bootstrap:
-                if self.redis_meta_client.init_meta(node_id) is None:
-                    raise RuntimeError(
-                        f"Failed to register radix cluster rank {cluster_rank} "
-                        f"as FlexKV node id {node_id}: "
-                        f"{self.redis_meta_client.get_init_error()}"
-                    )
-            else:
-                self.redis_meta_client.set_node_id(node_id)
+            if self.redis_meta_client.init_meta(node_id) is None:
+                raise RuntimeError(
+                    f"Failed to register radix cluster rank {node_id} as FlexKV "
+                    f"node id: {self.redis_meta_client.get_init_error()}"
+                )
             self.cache_config.distributed_node_id = int(node_id)
-
-        if is_bootstrap:
-            # Reserve extra channels beyond the internal DP clients so external
-            # processes (e.g. a prefetch controller) can attach to the shared TE
-            # using channel_ids in [total_clients, total_clients + num_extra).
-            num_extra = getattr(GLOBAL_CONFIG_FROM_ENV, "num_extra_te_channels", 0)
-            self._shm_te_process = TransferManagerShmTEProcess(
-                self.model_config, self.cache_config,
-                gpu_register_port=self.gpu_register_port,
-                server_id=te_server_id,
-                num_channels=total_clients + num_extra,
-                total_clients=total_clients,
+            flexkv_logger.info(
+                f"[kv manager] radix node {self._shm_radix_id} = FlexKV "
+                f"node id {node_id}, registered at "
+                f"{self.cache_config.redis_host}:{self.cache_config.redis_port}"
             )
-            self._shm_te_process.start()
 
-        # GlobalCacheEngine inspects GLOBAL_CONFIG_FROM_ENV.radix_shmem and
-        # constructs CacheEngineRadixShmem (RadixClient) per device type.
-        # KVTaskEngine wires up the shm-mode TransferManagerHandle.
-        self.kv_task_engine = KVTaskEngine(
+        # Extra channels past the internal DP clients let external processes (e.g.
+        # a prefetch controller) attach at channel_ids >= total_clients.
+        total_clients = self.model_config.total_clients
+        self._shm_te_process = TransferManagerShmTEProcess(
             self.model_config, self.cache_config,
-            self.gpu_register_port,
-            redis_meta=self.redis_meta_client,
-            event_collector=event_collector,
-            shm_te_server_id=te_server_id,
-            shm_te_channel_id=self.dp_client_id,
+            gpu_register_port=self.gpu_register_port,
+            server_id=self._shm_radix_id,
+            num_channels=total_clients + GLOBAL_CONFIG_FROM_ENV.num_extra_te_channels,
+            total_clients=total_clients,
         )
+        self._shm_te_process.start()
 
     def start(self) -> None:
         if self.enable_mps:

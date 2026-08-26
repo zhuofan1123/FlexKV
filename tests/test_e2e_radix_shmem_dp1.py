@@ -71,7 +71,7 @@ def main() -> int:
     os.environ["FLEXKV_SHM_RADIX_ID"] = f"e2e{os.getpid()}"
     os.environ["FLEXKV_ENABLE_MPS"] = "0"
     GLOBAL_CONFIG_FROM_ENV.radix_shmem = True
-    GLOBAL_CONFIG_FROM_ENV.shm_radix_server_id = os.environ["FLEXKV_SHM_RADIX_ID"]
+    GLOBAL_CONFIG_FROM_ENV.shm_radix_id = os.environ["FLEXKV_SHM_RADIX_ID"]
     GLOBAL_CONFIG_FROM_ENV.enable_mps = False
 
     model_config = ModelConfig(
@@ -84,7 +84,7 @@ def main() -> int:
     )
 
     print(f"radix_shmem={GLOBAL_CONFIG_FROM_ENV.radix_shmem}, "
-          f"server_id={GLOBAL_CONFIG_FROM_ENV.shm_radix_server_id}")
+          f"shm_radix_id={GLOBAL_CONFIG_FROM_ENV.shm_radix_id}")
     kvm = KVManager(model_config, cache_config, dp_client_id=0)
     print("KVManager constructed")
     kvm.start()

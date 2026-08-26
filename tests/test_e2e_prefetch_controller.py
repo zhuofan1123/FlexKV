@@ -94,7 +94,7 @@ def _set_radix_env(server_id: str):
     os.environ["FLEXKV_SERVER_RECV_PORT"] = f"ipc:///tmp/flexkv_{server_id}"
     from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
     GLOBAL_CONFIG_FROM_ENV.radix_shmem = True
-    GLOBAL_CONFIG_FROM_ENV.shm_radix_server_id = server_id
+    GLOBAL_CONFIG_FROM_ENV.shm_radix_id = server_id
     GLOBAL_CONFIG_FROM_ENV.enable_mps = False
     GLOBAL_CONFIG_FROM_ENV.server_recv_port = f"ipc:///tmp/flexkv_{server_id}"
 

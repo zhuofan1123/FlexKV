@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# FlexKV × radixshmem: CROSS-NODE KV reuse test (doc radixshmem_cross_node.md §5.1),
+# FlexKV × radixshmem: CROSS-NODE KV reuse test (doc radixshmem_cross_node.md §4.1),
 # driven through vLLM.
 #
 # Simulates TWO FlexKV nodes on ONE host, each running 4 DP engines:
@@ -14,7 +14,7 @@
 #                        \                    /
 #                         etcd rendezvous (world_size=2)
 #                         RDMA remote tree walk   <- control plane
-#                         mooncake + Redis        <- data plane (PEERH2H)
+#                         mooncake + Redis        <- data plane
 #
 # WHY FLEXKV_DP_SIZE IS REQUIRED, NOT COSMETIC:
 #   FlexKV keeps the DP engines of one node apart by
@@ -44,27 +44,37 @@
 #
 # WHY IT ALSO CHECKS THE KV, NOT JUST THE PLUMBING:
 #   Moving bytes is not the same as moving the RIGHT bytes. Phase 2 answers the
-#   prompts on node 1 with the prefix pulled off node 0 over PEERH2H; phase 3
-#   answers the SAME prompts on node 0, which holds that prefix in its own cpu
-#   tier. Same model, same prompt, same reused blocks, temperature=0 -- the only
-#   difference is where the KV came from, so the two must produce identical
-#   completions. If they differ, the KV that crossed the network is not the KV
-#   node 0 stored. Completions land in $LOG_DIR/output_check.json.
+#   prompts on node 1 with the prefix pulled off node 0; phase 3 answers the SAME
+#   prompts on node 0, which holds that prefix itself. Same model, same prompt,
+#   same reused blocks, temperature=0 -- the only difference is where the KV came
+#   from, so the two must produce identical completions. If they differ, the KV
+#   that crossed the network is not the KV node 0 stored. Completions land in
+#   $LOG_DIR/output_check.json.
 #   Scope: end-to-end evidence. For a per-(layer, block) byte comparison of the
 #   peer path, see tests/test_e2e_radix_peer_data.py.
 #
 # Config via env (defaults shown):
 #   VENV=/root/vllm-env  MODEL=Qwen/Qwen3-0.6B  PORT_BASE=31000  DP=4
-#   CPU_CACHE_GB=8  SHM_ID=xnode_<pid>  READY_TIMEOUT=900
-#   LOG_DIR=/tmp/flexkv-xnode-<pid>  NUM_PROMPTS=8  HIT_MIN=50
+#   CPU_CACHE_GB=1  SSD_CACHE_GB=8  FLOOD_PROMPTS=40  NUM_PROMPTS=8  HIT_MIN=50
+#   SHM_ID=xnode_<pid>  LOG_DIR=/tmp/flexkv-xnode-<pid>  READY_TIMEOUT=900
 #   ETCD=http://127.0.0.1:2379  RDMA_DEV=<first ACTIVE>  REDIS_PORT=<free>
-#   PROTOCOL=tcp             # mooncake data-plane protocol: tcp | rdma
+#   PROTOCOL=rdma            # mooncake data-plane protocol: rdma | tcp
 #   OUTPUT_CHECK=strict      # peer-KV vs local-KV check: strict | warn | off
+#
+# THE DEFAULT RUN COVERS BOTH TIERS, AND AIMS PHASE 2 AT THE PEER'S SSD:
+#   Each tier rendezvouses in its own etcd namespace, so a node running CPU + SSD
+#   registers both without one overwriting the other -- covered only when both are
+#   on. `_shm_get_spans` ranks a peer's CPU tier ahead of its SSD tier, so a
+#   surviving peer CPU copy would serve every block and PEERSSD2H would never be
+#   asked; hence the small CPU pool and the flood phase that evicts it (below).
+#   SSD_CACHE_GB=0 falls back to a CPU-only run over PEERH2H.
 #
 # Usage:  bash scripts/run_shmradix_repro.sh
 #         DP=2 bash scripts/run_shmradix_repro.sh   # 2 nodes x 2 DP = 4 GPUs
 #         HIT_MIN=100 bash scripts/run_shmradix_repro.sh
 #         OUTPUT_CHECK=warn bash scripts/run_shmradix_repro.sh
+#         SSD_CACHE_GB=0 bash scripts/run_shmradix_repro.sh  # CPU tier only
+#         PROTOCOL=tcp bash scripts/run_shmradix_repro.sh    # no RDMA NIC
 #
 # Runs from anywhere -- it drives vLLM over HTTP and needs no repo-relative path.
 # Nothing here depends on the other scripts in this directory.
@@ -76,14 +86,23 @@ MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
 PORT_BASE="${PORT_BASE:-31000}"
 DP="${DP:-4}"                       # engines per node
 NODES=2                             # radix world_size; the point of the test
-CPU_CACHE_GB="${CPU_CACHE_GB:-8}"
+SSD_CACHE_GB="${SSD_CACHE_GB:-8}"
+if (( SSD_CACHE_GB > 0 )); then
+  # A peer SSD read only serves blocks the peer's CPU tier no longer holds, so the
+  # CPU pool is kept small enough for FLOOD_PROMPTS to evict.
+  CPU_CACHE_GB="${CPU_CACHE_GB:-1}"
+  FLOOD_PROMPTS="${FLOOD_PROMPTS:-40}"
+else
+  CPU_CACHE_GB="${CPU_CACHE_GB:-8}"
+  FLOOD_PROMPTS=0
+fi
 SHM_ID="${SHM_ID:-xnode_$$}"
 READY_TIMEOUT="${READY_TIMEOUT:-900}"
 LOG_DIR="${LOG_DIR:-/tmp/flexkv-xnode-$$}"
 NUM_PROMPTS="${NUM_PROMPTS:-8}"
 HIT_MIN="${HIT_MIN:-50}"
 ETCD="${ETCD:-http://127.0.0.1:2379}"
-PROTOCOL="${PROTOCOL:-tcp}"
+PROTOCOL="${PROTOCOL:-rdma}"
 # How to treat a phase-2 (peer KV) completion that differs from its phase-3 (local
 # KV) counterpart: strict fails the run, warn reports it and keeps going -- for
 # hosts whose two node halves are not kernel-identical (mixed GPU models), where
@@ -97,6 +116,10 @@ LOG_INTERVAL=$(( NUM_PROMPTS / DP )); (( LOG_INTERVAL > 0 )) || LOG_INTERVAL=1
 
 TOTAL=$(( NODES * DP ))   # engines overall; API ports are one per NODE
 PIDS=(); PGIDS=()
+# CacheConfig rejects an SSD tier that is not strictly larger than the CPU one
+# (flexkv/common/config.py:876), and the eviction workload needs the headroom too.
+(( SSD_CACHE_GB == 0 || SSD_CACHE_GB > CPU_CACHE_GB )) || \
+  { echo "[xnode] ERROR: SSD_CACHE_GB=$SSD_CACHE_GB must exceed CPU_CACHE_GB=$CPU_CACHE_GB"; exit 2; }
 REDIS_PID=""
 CONF_DIR="$LOG_DIR/conf"
 
@@ -111,19 +134,20 @@ die() { log "ERROR: $*"; exit 2; }
 #     this run's value. Matching on the cmdline instead would reap unrelated work
 #     from the same venv -- the interpreter path "$VENV/bin/python" itself contains
 #     "vllm", so a plain *vllm* pattern hits every pytest run on the box.
+#     The value is per-node ("${SHM_ID}_r<node>"), so match on the prefix.
 reap_run_procs() {
   local p exe
   for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
     exe=$(readlink -f "/proc/$p/exe" 2>/dev/null) || continue
     [[ "$exe" == "$VENV/"* ]] || continue
     tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null \
-      | grep -qxF "FLEXKV_SHM_RADIX_ID=$SHM_ID" || continue
+      | grep -qF "FLEXKV_SHM_RADIX_ID=$SHM_ID" || continue
     kill -9 "$p" 2>/dev/null
   done
 }
 
 cleanup() {
-  local rc=$? g i
+  local rc=$? g i tier
   trap - EXIT INT TERM          # disarm to avoid re-entry
   echo; log "=== graceful cleanup ==="
   # 1) the vLLM process groups: SIGTERM, wait, then SIGKILL
@@ -146,13 +170,20 @@ cleanup() {
   #    not reap; it holds no GPU and clears on container restart.
   echo quit | nvidia-cuda-mps-control 2>/dev/null
   pkill -9 nvidia-cuda-mps 2>/dev/null
-  # 5) the POSIX shm radix / TE regions for this run
-  rm -f /dev/shm/*flexkv* /dev/shm/*"${SHM_ID}"* 2>/dev/null
+  # 5) the POSIX shm radix / TE regions for this run, plus the ssd tier's block
+  #    files -- those are GBs; the logs next to them are kept
+  rm -f /dev/shm/*flexkv* /dev/shm/*shmradix* /dev/shm/*"${SHM_ID}"* 2>/dev/null
   rm -f /tmp/flexkv_"${SHM_ID}"* 2>/dev/null
-  # 6) our private redis, and the etcd rendezvous keys for this cluster_id
+  rm -rf "$LOG_DIR"/ssd_r* 2>/dev/null
+  # 6) our private redis, and this cluster's etcd rendezvous keys. shmradix roots
+  #    them at "radix/<cluster_id>/", and FlexKV gives each tier its own cluster_id
+  #    ("<SHMRADIX_CLUSTER_ID>_<tier>"), so every tier needs deleting.
   [[ -n "$REDIS_PID" ]] && kill -9 "$REDIS_PID" 2>/dev/null
-  command -v etcdctl >/dev/null 2>&1 && \
-    ETCDCTL_API=3 etcdctl --endpoints="$ETCD" del --prefix "$SHM_ID" >/dev/null 2>&1
+  if command -v etcdctl >/dev/null 2>&1; then
+    for tier in cpu ssd remote; do
+      ETCDCTL_API=3 etcdctl --endpoints="$ETCD" del --prefix "radix/${SHM_ID}_${tier}/" >/dev/null 2>&1
+    done
+  fi
   log "GPU mem after cleanup: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null | tr '\n' ' ')"
   log "logs kept in $LOG_DIR"
   log "cleanup done (exit $rc)"
@@ -247,37 +278,46 @@ for ((R=0; R<NODES; R++)); do
 EOF
   # local_zmq_port needs its successor free too (PEERSSD2H uses port+1), so the
   # two nodes get non-adjacent bases.
+  # Each node needs its OWN ssd dir: the two share a host, and one dir would have
+  # them writing each other's block files.
+  SSD_DIR="$LOG_DIR/ssd_r$R"; rm -rf "$SSD_DIR"; mkdir -p "$SSD_DIR"
   cat > "$CONF_DIR/flexkv_r$R.json" <<EOF
 {"cpu_cache_gb": $CPU_CACHE_GB,
- "ssd_cache_gb": 0,
+ "ssd_cache_gb": $SSD_CACHE_GB,
+ "ssd_cache_dir": "$SSD_DIR",
  "enable_p2p_cpu": true,
- "enable_p2p_ssd": false,
+ "enable_p2p_ssd": $([[ "$SSD_CACHE_GB" -gt 0 ]] && echo true || echo false),
  "redis_host": "127.0.0.1",
  "redis_port": $REDIS_PORT,
  "local_ip": "127.0.0.1",
  "local_zmq_ip": "127.0.0.1",
  "local_zmq_port": $(( ZMQ_BASE + R * 4 ))}
 EOF
-  log "node $R: mooncake engine_port=$MC_PORT zmq_base=$(( ZMQ_BASE + R * 4 ))"
+  log "node $R: mooncake engine_port=$MC_PORT zmq_base=$(( ZMQ_BASE + R * 4 ))$( (( SSD_CACHE_GB > 0 )) && echo " ssd=$SSD_DIR" )"
 done
 
 # pre-clean stale state
 for ((i=0; i<NODES; i++)); do fuser -k "$(( PORT_BASE + i ))/tcp" 2>/dev/null; done
-rm -f /dev/shm/*flexkv* 2>/dev/null
+rm -f /dev/shm/*flexkv* /dev/shm/*shmradix* 2>/dev/null
 echo quit | nvidia-cuda-mps-control 2>/dev/null   # release GPU held by a stale daemon
 pkill -9 nvidia-cuda-mps 2>/dev/null
 
 # ---------------- launch 2 nodes x DP engines ----------------
-# Shared by all engines: the cluster identity. Distinct per node: radix rank,
-# the TE ipc endpoint (and the gpu_register port derived from it), the config
-# files, the GPU set, the API port. Distinct per engine within a node: dp_rank
-# (from vLLM's data_parallel_index) and everything keyed off dp_client_id.
+# Shared by all engines: SHMRADIX_CLUSTER_ID, the base of the etcd namespaces they
+# meet in -- FlexKV appends the tier (radix/<id>_cpu/, radix/<id>_ssd/) so a node's
+# tiers cannot overwrite each other's peer entry.
+# Distinct per node: FLEXKV_SHM_RADIX_ID (names its shm regions),
+# SHMRADIX_NODE_NAME (its etcd identity, which would otherwise come from the bind
+# IP both nodes share), the TE ipc endpoint (and the gpu_register port derived
+# from it), the config files, the GPU set, the API port. Distinct per engine
+# within a node: dp_rank (from vLLM's data_parallel_index) and dp_client_id.
+# MC_FORCE_TCP is what actually makes PROTOCOL=tcp true: mooncake ignores the
+# config's "protocol" and installs its rdma transport whenever it discovers an HCA.
+if [[ "$PROTOCOL" == tcp ]]; then export MC_FORCE_TCP=1; fi
 export FLEXKV_RADIX_SHMEM=1 \
-       FLEXKV_SHM_RADIX_ID="$SHM_ID" \
        FLEXKV_RADIX_WORLD_SIZE="$NODES" \
        FLEXKV_RADIX_REGISTRY="$ETCD" \
-       FLEXKV_RADIX_CLUSTER_ID="$SHM_ID" \
-       FLEXKV_RADIX_RPC_ADDRESS=127.0.0.1 \
+       SHMRADIX_CLUSTER_ID="$SHM_ID" \
        FLEXKV_RADIX_RDMA_DEV="$RDMA_DEV" \
        FLEXKV_TRACE_RADIX_PEER=1 \
        FLEXKV_DP_SIZE="$DP" \
@@ -293,7 +333,9 @@ for ((R=0; R<NODES; R++)); do
   gpus=$(seq -s, $(( R * DP )) $(( R * DP + DP - 1 )))
   lf="$LOG_DIR/n${R}.log"; : > "$lf"
   CUDA_VISIBLE_DEVICES="$gpus" \
-  FLEXKV_RADIX_RANK="$R" \
+  FLEXKV_SHM_RADIX_ID="${SHM_ID}_r${R}" \
+  SHMRADIX_NODE_NAME="${SHM_ID}_r${R}" \
+  FLEXKV_RADIX_RPC_ADDRESS=127.0.0.1 \
   FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_${SHM_ID}_r${R}" \
   FLEXKV_CONFIG_PATH="$CONF_DIR/flexkv_r$R.json" \
   MOONCAKE_CONFIG_PATH="$CONF_DIR/mooncake_r$R.json" \
@@ -336,10 +378,12 @@ log "both nodes READY ($TOTAL engines)"
 # ---------------- drive the cross-node workload ----------------
 log "phase 1 -> node 0 only (populate); phase 2 -> node 1 only (must read across)"
 MODEL="$MODEL" PORT_BASE="$PORT_BASE" NUM_PROMPTS="$NUM_PROMPTS" DP="$DP" \
+FLOOD_PROMPTS="$FLOOD_PROMPTS" \
 LOG_DIR="$LOG_DIR" python - <<'PY'
 import os, json, time, urllib.request
 MODEL = os.environ["MODEL"]; BASE = int(os.environ["PORT_BASE"])
 N = int(os.environ["NUM_PROMPTS"]); DP = int(os.environ["DP"])
+FLOOD = int(os.environ["FLOOD_PROMPTS"])
 LOG_DIR = os.environ["LOG_DIR"]
 # One API port per node. Requests carry "X-data-parallel-rank", which vLLM's DP
 # client honours verbatim (v1/engine/core_client.py: request.data_parallel_rank
@@ -365,13 +409,15 @@ def send(port, p, dp_rank):
         return f"ERR:{type(e).__name__}", ""
 
 def phase(name, node):
+    """Returns [(status, text), ...] -- the status stays attached so that a request
+    which never came back is reported as a transport failure, not a KV difference."""
     port = node_ports[node]
     res = [send(port, p, i % DP) for i, p in enumerate(prompts)]
     ok = sum(1 for c, _ in res if c == 200)
     print(f"  {name}: node {node} (:{port}), {len(prompts)} reqs, ok={ok}", flush=True)
     if ok != len(prompts):
         print(f"    non-200: {[c for c, _ in res if c != 200]}", flush=True)
-    return [t for _, t in res]
+    return res
 
 def drain(node):
     """Force every engine on `node` to finalize its last request's PUT.
@@ -389,31 +435,55 @@ def drain(node):
     print(f"  drain: node {node} (:{port}), {DP} reqs (one per engine)",
           flush=True)
 
-phase("phase1-populate", 0)
+def flood(node):
+    """Push FLOOD fresh prompts through `node` to evict the phase-1 prefixes from
+    its SMALL cpu tier while its larger ssd tier keeps them.
+
+    Only then can phase 2's peer tail come over PEERSSD2H: `_shm_get_spans` ranks
+    a peer's cpu tier ahead of its ssd tier, so a surviving peer cpu copy would
+    serve every block and the ssd path would never be asked. Runs after phase 1's
+    PUTs have landed, or the eviction order is a race between the two workloads.
+    """
+    port = node_ports[node]
+    res = [send(port, f"Flood {i}. {filler} Please summarize flood {i}.", i % DP)
+           for i in range(FLOOD)]
+    ok = sum(1 for c, _ in res if c == 200)
+    print(f"  flood: node {node} (:{port}), {FLOOD} reqs, ok={ok}", flush=True)
+
+fresh = phase("phase1-populate", 0)
 # The radix index publishes a block only after its bytes have landed (insert()
 # runs post-transfer and flushes), so node 1 cannot see the prefix until node 0's
 # async PUT completes.
 drain(0)
 print("  sleeping 20s for node 0's async PUT to land + publish...", flush=True)
 time.sleep(20)
+if FLOOD:
+    flood(0)
+    drain(0)
+    print("  sleeping 20s for the flood's PUT + cpu eviction to settle...",
+          flush=True)
+    time.sleep(20)
 peer = phase("phase2-crossnode", 1)
-# The same prompts once more, but on node 0, which serves the prefix from its OWN
-# cpu tier -- no peer involved. Everything is shared with phase 2 except the leg
-# that crosses nodes. Runs AFTER phase 2 so it cannot perturb it.
+# The same prompts once more, but on node 0, which holds the prefix in its own
+# tiers. Everything is shared with phase 2 except the leg that crosses nodes.
+# Runs AFTER phase 2 so it cannot perturb it.
 local = phase("phase3-localreuse", 0)
 
 # Is the KV that crossed the network the KV node 0 stored? Both phases reused the
 # same blocks for the same prompts at temperature=0, so they can only disagree if
 # the bytes disagree. Mismatching texts are kept so a failure says WHAT diverged.
-same = sum(1 for a, b in zip(peer, local) if a == b)
-mismatches = [{"index": i, "peer": a, "local": b}
-              for i, (a, b) in enumerate(zip(peer, local)) if a != b]
-report = {"total": len(prompts), "peer_equals_local": same,
-          "mismatches": mismatches}
+paired = [(i, p[1], l[1]) for i, (p, l) in enumerate(zip(peer, local))
+          if p[0] == 200 and l[0] == 200]
+same = sum(1 for _, a, b in paired if a == b)
+mismatches = [{"index": i, "peer": a, "local": b} for i, a, b in paired if a != b]
+errors = {name: [c for c, _ in res if c != 200] for name, res in
+          (("phase1", fresh), ("phase2", peer), ("phase3", local))}
+report = {"total": len(prompts), "compared": len(paired), "peer_equals_local": same,
+          "errors": errors, "mismatches": mismatches}
 with open(os.path.join(LOG_DIR, "output_check.json"), "w") as f:
     json.dump(report, f, indent=1, ensure_ascii=False)
 print(f"  output check: phase-2 peer KV and phase-3 local KV agree on "
-      f"{same}/{len(prompts)} prompts", flush=True)
+      f"{same}/{len(paired)} prompts", flush=True)
 time.sleep(8)
 PY
 
@@ -432,11 +502,15 @@ echo; log "=== gates ==="
 eng=$(grep -c "use_radix_shmem: True" "$ALL" || true)
 [[ "$eng" == "$TOTAL" ]]; check "all $TOTAL engines on radixshmem" $? "n=$eng"
 
-# 2. Per node exactly ONE region owner; the other DP engines attach as clients.
-#    Two owners in a node means the dp_client_id partitioning collapsed.
+# 2. Per node and TIER exactly ONE region owner; the other DP engines attach as
+#    clients. Two owners in a node means the dp_client_id partitioning collapsed.
+#    The name is spelled out (tier + node identity), so a rename fails the gate.
+TIERS=(cpu); (( SSD_CACHE_GB > 0 )) && TIERS+=(ssd)
 for ((R=0; R<NODES; R++)); do
-  o=$(grep -c "creating shm radix region .*_cpu_r${R} " "$ALL" || true)
-  [[ "$o" == 1 ]]; check "node $R: single shm radix region owner" $? "n=$o"
+  for T in "${TIERS[@]}"; do
+    o=$(grep -c "creating shm radix region /shmradix_${SHM_ID}_r${R}_${T}_${SHM_ID}_r${R} " "$ALL" || true)
+    [[ "$o" == 1 ]]; check "node $R: single $T shm radix region owner" $? "n=$o"
+  done
 done
 
 # 3. The two nodes joined ONE cluster with DISTINCT etcd-assigned ranks. This is
@@ -465,33 +539,49 @@ peerq=$(grep -oE "\[RADIX PEER QUERY\].*peer_hit=[0-9]+" "$ALL" | grep -oE "peer
 rdma=$(grep -oE "rdma_reads=[0-9]+" "$ALL" | cut -d= -f2 | awk '$1>0' | wc -l)
 [[ "$rdma" -gt 0 ]]; check "remote tree walk issued RDMA reads" $? "n=$rdma"
 
-# 7. ...and bytes really crossed on the peer data path.
-ph2h=$(grep -c "PEERH2H transfer request" "$ALL" || true)
-[[ "$ph2h" -gt 0 ]]; check "PEERH2H transfers present" $? "n=$ph2h"
-ph2h_bytes=$(grep "PEERH2H transfer request" "$ALL" | grep -oE "bytes=[0-9]+" \
-             | cut -d= -f2 | awk '{s+=$1} END{print s+0}')
-[[ "$ph2h_bytes" -gt 0 ]]; check "PEERH2H moved non-zero bytes" $? "total=$ph2h_bytes B"
+# 7. ...and bytes really crossed on the peer data path. The flood aims phase 2's
+#    tail at the peer's ssd tier, so with the ssd tier on THAT is the gated path and
+#    PEERH2H (phase 3 reading node 1's copy back) is only reported.
+peer_path_gate() {  # peer_path_gate <TransferType> [info]
+  local n b
+  n=$(grep -c "$1 transfer request" "$ALL" || true)
+  b=$(grep "$1 transfer request" "$ALL" | grep -oE "bytes=[0-9]+" \
+      | cut -d= -f2 | awk '{s+=$1} END{print s+0}')
+  if [[ -n "${2:-}" ]]; then log "  info : $1 transfers n=$n total=$b B"; return; fi
+  [[ "$n" -gt 0 ]]; check "$1 transfers present" $? "n=$n"
+  [[ "$b" -gt 0 ]]; check "$1 moved non-zero bytes" $? "total=$b B"
+}
+if (( SSD_CACHE_GB > 0 )); then
+  peer_path_gate PEERSSD2H
+  peer_path_gate PEERH2H info
+else
+  peer_path_gate PEERH2H
+fi
 
-# 8. ...and they were the RIGHT bytes: phase 2 (node 1, prefix pulled over
-#    PEERH2H) must decode to exactly what phase 3 (node 0, the same prefix straight
-#    from its own cpu tier) decodes. Same model, same prompt, same reused blocks,
-#    greedy decoding -- the ONLY difference is where the KV came from, so any
-#    divergence is the peer path's fault. Correct plumbing cannot satisfy this by
-#    accident, which is what makes it the hard gate.
+# 8. ...and they were the RIGHT bytes: phase 2 (node 1, prefix pulled off the peer)
+#    must decode to exactly what phase 3 (node 0, which holds that prefix itself)
+#    decodes. Same model, same prompt, same reused blocks, greedy decoding -- the
+#    ONLY difference is where the KV came from, so any divergence is the peer path's
+#    fault. Correct plumbing cannot satisfy this by accident, which is what makes it
+#    the hard gate.
 CHK="$LOG_DIR/output_check.json"
 GATE_KV="phase-2 peer KV decodes the same as phase-3 local KV"
 if [[ "$OUTPUT_CHECK" == off ]]; then
   log "  skip : $GATE_KV  (OUTPUT_CHECK=off)"
 else
-  read -r agree tot < <(python - "$CHK" <<'PY'
+  read -r agree tot errs < <(python - "$CHK" <<'PY'
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
-    print(int(d["peer_equals_local"]), int(d["total"]))
+    errs = sum(len(v) for v in d.get("errors", {}).values())
+    print(int(d["peer_equals_local"]), int(d["compared"]), errs)
 except Exception:
-    print(-1, 0)  # missing/unparseable => treated as a failure below
+    print(-1, 0, -1)  # missing/unparseable => treated as a failure below
 PY
 )
+  # A request that never returned leaves nothing to compare, so it gets its own
+  # gate: the KV gate must not absorb (or hide behind) a transport failure.
+  [[ "$errs" == 0 ]]; check "every workload request returned 200" $? "non-200=$errs"
   if [[ "$tot" -gt 0 && "$agree" == "$tot" ]]; then
     check "$GATE_KV" 0 "$agree/$tot identical"
   elif [[ "$OUTPUT_CHECK" == warn ]]; then
@@ -508,26 +598,40 @@ tb=$(grep -c "^Traceback" "$ALL" || true)
 [[ "$tb" == 0 ]]; check "no tracebacks" $? "n=$tb"
 
 # 10. Phase-2 reuse rate on node 1. Node 1 issues exactly NUM_PROMPTS peer-enabled
-#    GET queries (local_only=False) in phase 2 and never stored those tokens
-#    locally, so the share of them that found a peer tail IS the cross-node reuse
-#    rate. Counting the queries themselves -- instead of FlexKV's per-engine
+#    GET queries PER TIER (local_only=False) in phase 2 and never stored those
+#    tokens locally, so the share of them that found a peer tail IS the cross-node
+#    reuse rate. Counting the queries themselves -- instead of FlexKV's per-engine
 #    hit-ratio log -- keeps the measurement independent of how vLLM's DP load
 #    balancer happened to spread the requests over engines.
-echo; log "=== node 1 phase-2 cross-node reuse (min ${HIT_MIN}%) ==="
+#    The flood hands the serving tier to ssd when it is on, which is why the gated
+#    tier moves with it: node 0's cpu copy is gone by design, so its rate is ~0.
+GATED_TIER=cpu; (( SSD_CACHE_GB > 0 )) && GATED_TIER=ssd
+echo; log "=== node 1 phase-2 cross-node reuse, $GATED_TIER tier (min ${HIT_MIN}%) ==="
 N1="$LOG_DIR/n1.log"
-gets=$(grep -c "\[RADIX PEER QUERY\].*local_only=False" "$N1" 2>/dev/null || true)
-hitq=$(grep "\[RADIX PEER QUERY\].*local_only=False" "$N1" 2>/dev/null \
-       | grep -oE "peer_hit=[0-9]+" | cut -d= -f2 | awk '$1>0' | wc -l)
-[[ "$gets" == "$NUM_PROMPTS" ]]
-check "node1 issued one peer GET query per prompt" $? "queries=$gets want=$NUM_PROMPTS"
-if (( gets > 0 )); then
-  rate=$(awk -v h="$hitq" -v g="$gets" 'BEGIN{printf "%.2f", 100*h/g}')
-  awk -v r="$rate" -v m="$HIT_MIN" 'BEGIN{exit !(r+0 >= m+0)}'
-  check "node1 phase-2 GETs served from the peer" $? \
-        "$hitq/$gets = ${rate}% >= ${HIT_MIN}%"
-else
-  check "node1 phase-2 GETs served from the peer" 1 "no peer GET queries traced"
-fi
+for T in "${TIERS[@]}"; do
+  # The trace names the region it queried, so the tier is read off the shm name.
+  q="\[RADIX PEER QUERY\] shm=/shmradix_${SHM_ID}_r1_${T}_${SHM_ID}_r1 local_only=False"
+  gets=$(grep -cE "$q" "$N1" 2>/dev/null || true)
+  hitq=$(grep -E "$q" "$N1" 2>/dev/null \
+         | grep -oE "peer_hit=[0-9]+" | cut -d= -f2 | awk '$1>0' | wc -l)
+  # The parens are load-bearing: bare `g>0 ?` in printf's arg list parses as a
+  # redirection into a file named 0.
+  rate=$(awk -v h="$hitq" -v g="$gets" 'BEGIN{printf "%.2f", (g>0 ? 100*h/g : 0)}')
+  if [[ "$T" != "$GATED_TIER" ]]; then
+    log "  info : node1 $T-tier peer GETs $hitq/$gets = ${rate}%"
+    continue
+  fi
+  [[ "$gets" == "$NUM_PROMPTS" ]]
+  check "node1 issued one $T peer GET query per prompt" $? "queries=$gets want=$NUM_PROMPTS"
+  if (( gets > 0 )); then
+    awk -v r="$rate" -v m="$HIT_MIN" 'BEGIN{exit !(r+0 >= m+0)}'
+    check "node1 phase-2 GETs served from the peer's $T tier" $? \
+          "$hitq/$gets = ${rate}% >= ${HIT_MIN}%"
+  else
+    check "node1 phase-2 GETs served from the peer's $T tier" 1 \
+          "no peer GET queries traced"
+  fi
+done
 # Informational: FlexKV's own per-engine window (proc tag is "EngineCore_DP<i>"
 # under DP>1, plain "EngineCore" when DP=1).
 for ln in $(grep -oE "\(EngineCore[^ ]* pid=[0-9]+\).*FlexKV Hit Ratio: [0-9.]+%" "$N1" 2>/dev/null \

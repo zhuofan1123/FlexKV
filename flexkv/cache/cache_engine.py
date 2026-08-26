@@ -697,13 +697,9 @@ class GlobalCacheEngine:
         self.use_mooncake_store_backend = cache_config.use_mooncake_store_backend
 
         self.index_accel = GLOBAL_CONFIG_FROM_ENV.index_accel
-        # When True, replace per-device CacheEngine{,Accel} with the radixshmem-
-        # backed engine so multiple DP processes share a single index in shm.
-        self.use_radix_shmem = bool(getattr(GLOBAL_CONFIG_FROM_ENV, "radix_shmem", False))
-        self._shm_radix_server_id = getattr(
-            GLOBAL_CONFIG_FROM_ENV, "shm_radix_server_id", "default"
-        )
-        if cache_config.enable_kv_sharing:
+        self.use_radix_shmem = GLOBAL_CONFIG_FROM_ENV.radix_shmem
+        self._shm_radix_id = GLOBAL_CONFIG_FROM_ENV.shm_radix_id
+        if cache_config.enable_kv_sharing and not self.use_radix_shmem:
             assert redis_meta is not None
             self.redis_meta = redis_meta
             self.node_id = self.redis_meta.get_node_id()
@@ -888,14 +884,7 @@ class GlobalCacheEngine:
             device_type=device_type,
             num_total_blocks=num_blocks,
             tokens_per_block=self.cache_config.tokens_per_block,
-            shm_name=shm_name_for(
-                device_type,
-                self._shm_radix_server_id,
-                rank=getattr(GLOBAL_CONFIG_FROM_ENV, "radix_rank", 0),
-                world_size=getattr(
-                    GLOBAL_CONFIG_FROM_ENV, "radix_world_size", 1
-                ),
-            ),
+            shm_name=shm_name_for(device_type, self._shm_radix_id),
             evict_ratio=self.evict_ratio,
             evict_start_threshold=self.evict_start_threshold,
             hit_reward_seconds=self.hit_reward_seconds,
