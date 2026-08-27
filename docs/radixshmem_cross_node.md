@@ -122,6 +122,7 @@ export FLEXKV_RADIX_REGISTRY=etcd://10.0.0.1:2379    # 同一个 etcd
 
 export SHMRADIX_RHT_SLOTS=4                          # RHT 每个桶的槽位数，只接受 1/2/4/8（别的值会退回 1）
                                                      # 默认值是 1，而 1 跨节点复用直接失效，必须显式设置
+export FLEXKV_DP_SIZE=1                              # 使用DP时需要设置
 export SHMRADIX_CLUSTER_ID=flexkv                    # etcd 命名空间的前缀，不设时是 default；FlexKV 按层
  # 拼成 <前缀>_cpu / <前缀>_ssd，各层互不干扰；
  # 同一个 etcd 上跑多套集群必须各起一个名字；同一个 etcd 下仅一个集群时，可以不设
@@ -161,10 +162,11 @@ export FLEXKV_RADIX_BOOTSTRAP_TIMEOUT_SEC=120 # 等全员到齐的上限，默�
 - 一台机器上跑多个节点时，给每个节点一个不同的具体地址（`127.0.0.1` / `127.0.0.2` / …，
   端口由内核分配不会撞），或者用 `SHMRADIX_NODE_NAME` 直接指定身份（验证脚本走的是后者）。
 
-一台机器上跑多个flexkv实例时还需要为每个实例设置单独的ID：
+一台机器上跑多个flexkv实例时还需要为每个实例设置单独的ID和Server Port：
 
 ```bash
 export FLEXKV_SHM_RADIX_ID=node2               # shm region 名 + TE channel 名，默认 flexkv
+export FLEXKV_SERVER_RECV_PORT=ipc:///tmp/flexkv_$FLEXKV_SHM_RADIX_ID
 ```
 
 ### 3.2 JSON 配置文件
