@@ -13,6 +13,10 @@ What this validates:
   2. Both can put_async through the single shared TE (disjoint op_id ranges).
   3. Cross-DP prefix sharing: a sequence written by dp0 is visible in the shared
      index to dp1 via get_match (the whole point of the radix-shmem path).
+  4. Each DP's transfers land on its OWN GPU: both write a rank-distinct byte
+     pattern, PUT it, zero the blocks and GET it back. A DP whose ops are
+     mislabelled reaches another DP's handles, which shows up here as a byte
+     mismatch rather than as an error.
 
 Requires >=2 CUDA devices. Run inside the container:
 
@@ -36,6 +40,9 @@ NUM_GPU_BLOCKS = 256
 BLOCK_PER_REQUEST = 32
 # A fixed prefix that dp0 writes and dp1 later looks up across the shared index.
 SHARED_SEED = 0x5EED
+# GPU blocks phase 3 owns, past the ranges phases 1 and 2 use.
+ROUNDTRIP_START_BLOCK = 192
+PATTERN_SEED = 0xC0FFEE
 
 
 def _build_request(rng_seed: int, start_block: int, n_blocks: int):
@@ -45,6 +52,46 @@ def _build_request(rng_seed: int, start_block: int, n_blocks: int):
                     + np.tile(np.arange(TOKENS_PER_BLOCK), n_blocks))
     token_ids = rng.integers(0, 32000, size=slot_mapping.shape, dtype=np.int64)
     return token_ids, slot_mapping, block_ids
+
+
+def _block_pattern(layer: int, block_id: int, shape, dtype, writer: int):
+    """Per-(writer, block, layer) random bytes, derived identically in every proc.
+
+    `writer` is the DP id, so a transfer that reaches the wrong DP's GPU cannot
+    accidentally compare equal.
+    """
+    generator = torch.Generator().manual_seed(
+        PATTERN_SEED + writer * 1_000_003 + block_id * 128 + layer)
+    return torch.randn(tuple(shape), generator=generator).to(dtype)
+
+
+def _write_pattern(gpu_tensors, block_ids, writer: int) -> None:
+    for layer, tensor in enumerate(gpu_tensors):
+        for block_id in block_ids:
+            block = tensor[:, block_id]
+            block.copy_(_block_pattern(layer, int(block_id), block.shape,
+                                       tensor.dtype, writer))
+    torch.cuda.synchronize()
+
+
+def _clear_blocks(gpu_tensors, block_ids) -> None:
+    """Zero what the GET must refill, so a no-op transfer fails the check."""
+    for tensor in gpu_tensors:
+        for block_id in block_ids:
+            tensor[:, block_id].zero_()
+    torch.cuda.synchronize()
+
+
+def _mismatched_blocks(gpu_tensors, block_ids, writer: int) -> list:
+    bad = []
+    for layer, tensor in enumerate(gpu_tensors):
+        for block_id in block_ids:
+            got = tensor[:, block_id].cpu()
+            want = _block_pattern(layer, int(block_id), got.shape, got.dtype,
+                                  writer)
+            if not torch.equal(got, want):
+                bad.append((layer, int(block_id)))
+    return bad
 
 
 def _tp_client_proc(dp_client_id, tp_rank, server_recv_port,
@@ -119,7 +166,7 @@ def _dp_proc(dp_client_id, dp_size, server_id, write_barrier, result_q):
             daemon=True,
         )
         p.start()
-        _ = parent.recv()
+        gpu_tensors = [handle.get_tensor() for handle in parent.recv()]
         print(f"{tag} TP client registered", flush=True)
 
         deadline = time.monotonic() + 60
@@ -171,14 +218,40 @@ def _dp_proc(dp_client_id, dp_size, server_id, write_barrier, result_q):
             print(f"{tag} cross-DP match hit_blocks={shared_hit_blocks}",
                   flush=True)
 
+        # --- Phase 3: each DP round-trips its own bytes through its own GPU. ---
+        tok, slot, blk = _build_request(
+            rng_seed=7000 + dp_client_id, start_block=ROUNDTRIP_START_BLOCK,
+            n_blocks=BLOCK_PER_REQUEST)
+        # Both DPs use the same block ids on different devices, so the phases are
+        # kept in lockstep: a stray transfer then lands on a block under check.
+        _write_pattern(gpu_tensors, blk, writer=dp_client_id)
+        write_barrier.wait(60)
+        tid = kvm.put_async(token_ids=tok, slot_mapping=slot)
+        rt_put_ok = all(v.status == KVResponseStatus.SUCCESS
+                        for v in kvm.wait([tid], timeout=60,
+                                          completely=True).values())
+        write_barrier.wait(60)
+        _clear_blocks(gpu_tensors, blk)
+        write_barrier.wait(60)
+        tid = kvm.get_async(token_ids=tok, slot_mapping=slot)
+        resp = kvm.wait([tid], timeout=60, completely=True)[tid]
+        rt_hit = (int(np.count_nonzero(resp.return_mask)) // TOKENS_PER_BLOCK
+                  if resp.status == KVResponseStatus.SUCCESS
+                  and resp.return_mask is not None else 0)
+        write_barrier.wait(60)
+        rt_bad = len(_mismatched_blocks(gpu_tensors, blk, writer=dp_client_id))
+        print(f"{tag} roundtrip: put_ok={rt_put_ok} hit_blocks={rt_hit} "
+              f"mismatched={rt_bad}", flush=True)
+
         p.terminate()
         p.join()
         kvm.shutdown()
-        result_q.put((dp_client_id, own_ok, len(own), shared_hit_blocks))
+        result_q.put((dp_client_id, own_ok, len(own), shared_hit_blocks,
+                      rt_put_ok, rt_hit, rt_bad))
     except Exception:
         import traceback
         traceback.print_exc()
-        result_q.put((dp_client_id, -1, -1, -1))
+        result_q.put((dp_client_id, -1, -1, -1, False, -1, -1))
 
 
 def main() -> int:
@@ -202,11 +275,11 @@ def main() -> int:
         p.start()
 
     results = {}
-    deadline = time.monotonic() + 180
+    deadline = time.monotonic() + 300
     while len(results) < dp_size and time.monotonic() < deadline:
         try:
-            dp, ok, total, hit = result_q.get(timeout=5)
-            results[dp] = (ok, total, hit)
+            dp, ok, total, hit, rt_put_ok, rt_hit, rt_bad = result_q.get(timeout=5)
+            results[dp] = (ok, total, hit, rt_put_ok, rt_hit, rt_bad)
         except Exception:
             if not any(p.is_alive() for p in procs):
                 break
@@ -223,9 +296,17 @@ def main() -> int:
     if len(results) != dp_size:
         print(f"FAIL: only {len(results)}/{dp_size} DP procs reported")
         return 1
-    for dp, (ok, total, hit) in results.items():
+    for dp, (ok, total, hit, rt_put_ok, rt_hit, rt_bad) in results.items():
         if ok != total or ok < 0:
             print(f"FAIL: dp{dp} private puts {ok}/{total}")
+            return 1
+        if not rt_put_ok or rt_hit != BLOCK_PER_REQUEST:
+            print(f"FAIL: dp{dp} roundtrip put_ok={rt_put_ok} "
+                  f"hit_blocks={rt_hit}, want {BLOCK_PER_REQUEST}")
+            return 1
+        if rt_bad != 0:
+            print(f"FAIL: dp{dp} got {rt_bad} block(s) of KV that are not its "
+                  f"own — its transfers reached another DP's GPU")
             return 1
     # dp1 must have seen dp0's shared prefix through the shared index.
     dp1_hit = results[1][2]
@@ -234,7 +315,8 @@ def main() -> int:
         return 1
 
     print(f"PASS: dp2 radix-shmem OK — both DPs put through shared TE; "
-          f"dp1 matched {dp1_hit} blocks of dp0's prefix via shared index")
+          f"dp1 matched {dp1_hit} blocks of dp0's prefix via shared index; "
+          f"each DP round-tripped {BLOCK_PER_REQUEST} blocks on its own GPU")
     return 0
 
 
